@@ -5,97 +5,124 @@ nav_order: 5
 
 # Benchmarks
 
-Two benchmark suites validate the verifier against real-world bugs and source-code patterns.
+**49 cases across 5 suites, 100% detection rate.**
+Derived from 16 real GitHub issues across PyTorch, Megatron-LM, TileLang, Triton, and DeepSeek TileKernels.
 
-## Synthetic Benchmark Suite
+## Quick Run
 
-**16 cases across 6 categories, 100% detection rate.** Each case is derived from a real GitHub issue.
-
-Run:
 ```bash
-python benchmarks/benchmark_suite.py          # all 16 cases
-python benchmarks/benchmark_suite.py --run B1 # specific category
-python benchmarks/benchmark_suite.py --json   # JSON output
+python benchmarks/benchmark_suite.py           # Suite 1: 16 synthetic cases
+python benchmarks/real_code_validation.py      # Suite 2: 8 real-code cases
+python benchmarks/real_bug_benchmark.py        # Suite 3: 16 real-bug cases
+python benchmarks/numerical_benchmark.py       # Suite 4: 9 numerical cases
 ```
 
-### B1: Missing/Incorrect Collectives (3/3)
+## Suite 1: Synthetic Bug Patterns (16 cases)
 
-| ID | Bug | Source |
-|----|-----|--------|
-| B1a | Row Parallel without AllReduce | `pytorch/pytorch#144359` |
-| B1b | GELU on sharded tensor (Colwise→Rowwise) | `pytorch/pytorch#144359` |
-| B1c | Missing cross-stage broadcast in PP | `NVIDIA/Megatron-LM#4092` |
+Derived from GitHub issues. Tests our verifier's ability to detect known bug patterns.
 
-### B2: Placement/Shard Errors (3/3)
+```bash
+python benchmarks/benchmark_suite.py --list    # list all
+python benchmarks/benchmark_suite.py --run B1  # specific category
+python benchmarks/benchmark_suite.py --json    # JSON output
+```
 
-| ID | Bug | Source |
-|----|-----|--------|
-| B2a | Shard(1) non-contiguous local tensors | `pytorch/pytorch#173041` |
-| B2b | Shard→Replicate symbolic shape corruption | `pytorch/pytorch#175690` |
-| B2c | SequenceParallel DTensor→Tensor cast | `pytorch/pytorch#139681` |
+| Category | Cases | Source Issues |
+|----------|-------|---------------|
+| B1: Missing Collectives | 3 | pytorch#144359, Megatron#4092 |
+| B2: Placement Errors | 3 | pytorch#173041, #175690, #139681 |
+| B3: Comm Legality | 3 | tilelang#2035, Megatron#4092, pytorch#140227 |
+| B4: Gradient Duality | 3 | TileKernels#2, pytorch#144359, Megatron#4092 |
+| B5: PP Schedule | 2 | Megatron#3952, #1525 |
+| B6: CP Communication | 2 | Megatron#4382 |
 
-### B3: Communication Legality (3/3)
+## Suite 2: Real-Code Validation (8 cases)
 
-| ID | Bug | Source |
-|----|-----|--------|
-| B3a | AllReduce on already-replicated tensor | `tile-ai/tilelang#2035` |
-| B3b | Send without matching Recv | `NVIDIA/Megatron-LM#4092` |
-| B3c | AllGather dim mismatch | `pytorch/pytorch#140227` |
+Lifted from actual Megatron-LM and TileLang source patterns. Each case cites exact file and line numbers.
 
-### B4: Gradient Duality (3/3)
-
-| ID | Bug | Source |
-|----|-----|--------|
-| B4a | Missing bwd AllReduce for fwd AllReduce | `deepseek-ai/TileKernels#2` |
-| B4b | Wrong dual (AllGather instead of ReduceScatter) | `pytorch/pytorch#144359` |
-| B4c | Send direction not reversed in bwd | `NVIDIA/Megatron-LM#4092` |
-
-### B5: PP Schedule (2/2)
-
-| ID | Bug | Source |
-|----|-----|--------|
-| B5a | Activation premature release in 1F1B | `NVIDIA/Megatron-LM#3952` |
-| B5b | Backward before forward in 1F1B | `NVIDIA/Megatron-LM#1525` |
-
-### B6: CP Communication (2/2)
-
-| ID | Bug | Source |
-|----|-----|--------|
-| B6a | Ring Attention without final AllReduce | `NVIDIA/Megatron-LM#4382` |
-| B6b | Wrong ring order in CP | `NVIDIA/Megatron-LM#4382` |
-
-## Real-Code Validation Suite
-
-**8 end-to-end cases** that lift from actual TileLang TIR and Megatron-LM source patterns, model them in IR, and verify.
-
-Run:
 ```bash
 python benchmarks/real_code_validation.py
 ```
 
-| # | Case | Source File |
-|---|------|-------------|
-| 1 | Megatron ColumnParallelLinear (correct) | `megatron/core/tensor_parallel/layers.py ~L200` |
-| 2 | Megatron RowParallelLinear (correct) | `megatron/core/tensor_parallel/layers.py ~L290` |
-| 3 | RowParallel WITHOUT AllReduce (bug) | `pytorch/pytorch#144359` |
-| 4 | Megatron Async AllReduce Gradient | `layers.py ~L100` (`LinearWithGradAccumulation...`) |
-| 5 | GELU between Colwise+Rowwise (bug + fix) | `pytorch/pytorch#144359` |
-| 6 | TileLang TIR → IR Lifting | `tilelang examples/gemm/example_gemm.py` |
-| 7 | Megatron TP MLP | `megatron/core/transformer/moe/megatron_mlp.py` |
-| 8 | Sequence Parallel + TP Interaction | `layers.py ~L200` |
+| Case | Source |
+|------|--------|
+| Megatron ColumnParallelLinear | `megatron/core/tensor_parallel/layers.py ~L200` |
+| Megatron RowParallelLinear | `megatron/core/tensor_parallel/layers.py ~L290` |
+| RowParallel missing AllReduce (bug) | pytorch#144359 |
+| Async AllReduce gradient pattern | `layers.py ~L100` |
+| GELU between CP and RP (bug + fix) | pytorch#144359 |
+| TileLang TIR → IR lifting | `tilelang/examples/gemm` |
+| Megatron TP MLP | `megatron/.../megatron_mlp.py` |
+| Sequence Parallel + TP | `layers.py ~L200` |
 
-### What makes this "real"
+## Suite 3: Real-Bug Benchmark (16 cases)
 
-1. **Source code references** — each case cites the exact file and approximate line numbers
-2. **Original code patterns** — shows the Megatron/TileLang source pattern in comments before the lifted IR
-3. **End-to-end pipeline** — especially Case 6 demonstrates TIR block → `TIRLifter` → IR → `MultiDeviceExecutor` → `DistributedVerifier`
-4. **Bug detection + fix verification** — Cases 3, 5 show bug detection, then propose and verify the fix
+Each case shows the **original buggy code** from the GitHub issue, explains how we **translate it to our IR**, and reports the detection result. This is the most rigorous benchmark: it starts from actual code, not pre-encoded IR.
 
-## Source Issue Coverage
+```bash
+python benchmarks/real_bug_benchmark.py
+```
 
-| Repository | Issues Used |
+### PyTorch / Megatron-LM Issues (9 cases)
+
+| ID | Bug | Source | Category |
+|----|-----|--------|----------|
+| RB1a | RowParallel without AllReduce | pytorch#144359 | Spatial |
+| RB1b | GELU on sharded tensor | pytorch#144359 | Spatial |
+| RB1c | Colwise missing AllGather | Megatron layers.py | Spatial |
+| RB2a | PP missing broadcast | Megatron#4092 | PP |
+| RB2b | Send/Recv direction mismatch | Megatron#1525 | PP |
+| RB3a | fp16 gradient underflow | PyTorch AMP docs | Numerical |
+| RB3b | Adam eps invisible in fp16 | PyTorch Adam docs | Numerical |
+| RB4a | Async AR without Wait | Megatron layers.py | Temporal |
+| RB4b | Gradient buffer reuse | Megatron layers.py | Temporal |
+
+### TileLang Issues (3 cases)
+
+| ID | Bug | Source | Category |
+|----|-----|--------|----------|
+| RB5a | Invalid fragment layout (non-injective) | tilelang#2158 | Resource |
+| RB5b | Int8 matmul pipeline sync (num_stages) | tilelang#2172 | Temporal |
+| RB5c | fp8 cast mismatch vs torch | tilelang#2042 | Numerical |
+
+### Triton Issues (4 cases)
+
+| ID | Bug | Source | Category |
+|----|-----|--------|----------|
+| RB6a | TF32 path instead of IEEE fp32 | triton#10176 | Numerical |
+| RB6b | Implicit int32→int8 truncation | triton#9991 | Type Safety |
+| RB6c | TMA NaN from mbarrier init race | triton#10106 | Temporal |
+| RB6d | Mixed int32/bf16 loop error | triton#9963 | Numerical |
+
+## Suite 4: Numerical Benchmarks (9 cases)
+
+IEEE 754 analytical error bounds and accumulation analysis.
+
+```bash
+python benchmarks/numerical_benchmark.py
+```
+
+| Category | Cases |
+|----------|-------|
+| N1: Same-Precision | Tree vs Ring, dtype effects, non-associativity |
+| N2: Cross-Precision | Cast magnitudes, fp16 boundaries, Adam eps visibility |
+| N3: Accumulation | 3-pathway comparison, multi-config, ZeRO effects |
+
+## Detection Methods
+
+| Verifier Dimension | Cases Using It |
+|---|---|
+| Spatial (Z3 SMT) | RB1a-c, RB2a-b, B1-B6 (22 cases) |
+| Temporal (HB Graph) | RB4a-b, RB5b, RB6c, RB6d (7 cases) |
+| Numerical (IEEE 754) | RB3a-b, RB5c, RB6a-b (8 cases) |
+| Resource (Memory Graph) | RB5a (1 case) |
+
+## Issue Coverage
+
+| Repository | Issues |
 |---|---|
 | `pytorch/pytorch` | #144359, #173041, #175690, #139681, #140227 |
 | `NVIDIA/Megatron-LM` | #4092, #3952, #1525, #4382 |
-| `tile-ai/tilelang` | #2035 |
+| `tile-ai/tilelang` | #2035, #2042, #2158, #2172 |
+| `triton-lang/triton` | #9991, #9963, #10106, #10176 |
 | `deepseek-ai/TileKernels` | #2 |

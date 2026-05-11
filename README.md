@@ -5,7 +5,7 @@
 > before you launch a single GPU job.
 
 [![Tests](https://img.shields.io/badge/tests-42%20passed-green)]()
-[![Benchmarks](https://img.shields.io/badge/benchmarks-33%20cases%20%7C%20100%25%20detection-blue)]()
+[![Benchmarks](https://img.shields.io/badge/benchmarks-49%20cases%20%7C%20100%25%20detection-blue)]()
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)]()
 [![License](https://img.shields.io/badge/license-Apache%202.0-orange)]()
 
@@ -273,33 +273,65 @@ print(f"Llama-70B on H100: {'FITS' if fits else 'OOM'} ({mem['total']/(1024**3):
 
 ## Demos & Benchmarks
 
+### Examples (8 demo scripts)
+
 ```bash
-# Spatial verification
+# Spatial
 python examples/tp_linear.py       # Row Parallel: correct vs bug
-python examples/tp_mlp.py          # Megatron MLP
+python examples/tp_mlp.py          # Megatron MLP: Column+Row Parallel
 python examples/pp_2stage.py       # 2-Stage 1F1B Pipeline
-python examples/cp_ring_attn.py    # Ring Attention
+python examples/cp_ring_attn.py    # Ring Attention with FlashAttention
 
-# Temporal verification
-python examples/overlap_demo.py    # 5 cases: data race, missing wait, buffer alias
+# Temporal
+python examples/overlap_demo.py    # 5 cases: race, missing wait, buffer alias
 
-# Numerical verification
+# Numerical
 python examples/numerical_demo.py  # 7 sections: dtype, cast, reduction, accumulation
 
-# Resource / OOM detection
+# Resource/OOM
 python examples/oom_demo.py        # 6 sections: GPU specs, LLM memory, occupancy
 
 # Synthesis + LLM
-python examples/synthesis_demo.py  # Auto-synthesis + LLM extraction
+python examples/synthesis_demo.py  # Auto-synthesis + LLM extraction flow
+```
 
-# Benchmarks
-python benchmarks/benchmark_suite.py          # 16 synthetic cases (100% detection)
-python benchmarks/real_code_validation.py     # 8 real-code cases (Megatron + TileLang)
-python benchmarks/numerical_benchmark.py      # 9 numerical cases
+### Benchmarks (49 cases, 5 suites, 100% detection)
 
-# Tests
+```bash
+# Suite 1: Synthetic bug patterns (16 cases from PyTorch/Megatron/TileLang GitHub issues)
+python benchmarks/benchmark_suite.py
+
+# Suite 2: Real-code validation (8 cases lifted from Megatron-LM + TileLang source)
+python benchmarks/real_code_validation.py
+
+# Suite 3: Real-bug benchmark (16 cases with original buggy code + translation notes)
+#          9 from PyTorch/Megatron, 7 from TileLang/Triton
+python benchmarks/real_bug_benchmark.py
+
+# Suite 4: Numerical benchmark (9 cases: IEEE 754 bounds + accumulation analysis)
+python benchmarks/numerical_benchmark.py
+
+# Suite 5 (part of Suite 1): Pure spatial + temporal + schedule checks
+python benchmarks/benchmark_suite.py --list   # List all 16 cases by category
+python benchmarks/benchmark_suite.py --run B1 # Run specific category
+python benchmarks/benchmark_suite.py --json   # JSON output
+```
+
+### Tests
+
+```bash
 python -m pytest tests/test_verifier.py -v    # 42 tests
 ```
+
+### Issue Coverage
+
+| Repository | Issues Used |
+|---|---|
+| `pytorch/pytorch` | #144359, #173041, #175690, #139681, #140227 |
+| `NVIDIA/Megatron-LM` | #4092, #3952, #1525, #4382 |
+| `tile-ai/tilelang` | #2035, #2042, #2054, #2158, #2172 |
+| `triton-lang/triton` | #9991, #9963, #10106, #10176 |
+| `deepseek-ai/TileKernels` | #2 |
 
 ---
 
