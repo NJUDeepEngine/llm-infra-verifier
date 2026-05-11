@@ -212,7 +212,14 @@ class TensorState:
         )
 
     def __hash__(self):
-        return hash(self.name)
+        return hash((
+            self.name,
+            self.global_shape,
+            self.local_shape,
+            self.sharding.placements,
+            self.sharding.mesh.shape,
+            self.sharding.mesh.dim_names,
+        ))
 
     def __repr__(self):
         placement_str = ", ".join(repr(p) for p in self.sharding.placements)

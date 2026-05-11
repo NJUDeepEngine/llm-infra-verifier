@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 import copy
+import warnings
 
 from .state import (
     TensorState,
@@ -49,7 +50,21 @@ class DeviceState:
     def get(self, name: str) -> Optional[TensorState]:
         return self.tensors.get(name)
 
-    def set(self, tensor: TensorState):
+    def set(self, tensor: TensorState, warn_on_overwrite: bool = True):
+        if warn_on_overwrite:
+            existing = self.tensors.get(tensor.name)
+            if existing is not None and (
+                existing.global_shape != tensor.global_shape
+                or existing.sharding.placements != tensor.sharding.placements
+                or existing.local_shape != tensor.local_shape
+            ):
+                warnings.warn(
+                    f"Overwriting tensor '{tensor.name}' on device {self.device_id}: "
+                    f"old (shape={existing.global_shape}, local={existing.local_shape}, "
+                    f"placements={existing.sharding.placements}), "
+                    f"new (shape={tensor.global_shape}, local={tensor.local_shape}, "
+                    f"placements={tensor.sharding.placements})"
+                )
         self.tensors[tensor.name] = tensor
 
     def has(self, name: str) -> bool:
@@ -86,12 +101,23 @@ class MultiDeviceExecutor:
             device_ids = list(range(self.mesh.num_devices))
 
         for did in device_ids:
-            # Each device gets its own copy with device-scoped local shape
+            existing = self.devices[did].get(tensor.name)
+            if existing is not None:
+                warnings.warn(
+                    f"Re-registering tensor '{tensor.name}' on device {did}: "
+                    f"existing tensor will be overwritten. "
+                    f"old spec: shape={existing.global_shape}, "
+                    f"local={existing.local_shape}, "
+                    f"placements={existing.sharding.placements}"
+                )
+                break
+
+        for did in device_ids:
             local_t = copy.deepcopy(tensor)
             local_t.local_shape = compute_local_shape(
                 tensor.global_shape, tensor.sharding
             )
-            self.devices[did].set(local_t)
+            self.devices[did].set(local_t, warn_on_overwrite=False)
 
     def get_tensor(self, name: str, device_id: int = 0) -> Optional[TensorState]:
         """Get a tensor from a specific device."""
@@ -120,6 +146,15 @@ class MultiDeviceExecutor:
 
         # Return device 0's view of all tensors
         return dict(self.devices[0].tensors)
+
+    def reset_devices(self):
+        """Clear all tensor state from all devices.
+
+        Call this to start fresh without creating a new executor.
+        Note: this also clears registered initial tensors.
+        """
+        for dev in self.devices.values():
+            dev.tensors.clear()
 
     def run_fwd(self, program: Program) -> Dict[str, TensorState]:
         """Run forward pass only."""
@@ -154,7 +189,12 @@ class MultiDeviceExecutor:
         elif isinstance(op, FlashAttention):
             self._exec_flash_attn(op)
         else:
-            raise ValueError(f"Unknown op type: {type(op)}")
+            raise ValueError(
+                f"Unknown op type: {type(op).__name__} (repr: {op}). "
+                f"inputs={op.input_names}, output={op.output_name}. "
+                f"Supported types: MatMul, Add, Multiply, SiLU, AllReduce, AllGather, "
+                f"ReduceScatter, Send, Recv, Reshape, Transpose, FlashAttention"
+            )
 
         # Save intermediate state snapshot
         self._save_state()
@@ -165,6 +205,16 @@ class MultiDeviceExecutor:
             a = dev.get(op.a)
             b = dev.get(op.b)
             if a is None or b is None:
+                if a is None:
+                    warnings.warn(
+                        f"MatMul: input '{op.a}' not found on device {did}. "
+                        f"Skipping op. Available: {list(dev.tensors.keys())}"
+                    )
+                if b is None:
+                    warnings.warn(
+                        f"MatMul: input '{op.b}' not found on device {did}. "
+                        f"Skipping op. Available: {list(dev.tensors.keys())}"
+                    )
                 continue
             # Use the op's apply method with device-local context
             local_ctx = {op.a: a, op.b: b}
@@ -177,6 +227,16 @@ class MultiDeviceExecutor:
             a = dev.get(op.a)
             b = dev.get(op.b)
             if a is None or b is None:
+                if a is None:
+                    warnings.warn(
+                        f"{type(op).__name__}: input '{op.a}' not found on device {did}. "
+                        f"Skipping op. Available: {list(dev.tensors.keys())}"
+                    )
+                if b is None:
+                    warnings.warn(
+                        f"{type(op).__name__}: input '{op.b}' not found on device {did}. "
+                        f"Skipping op. Available: {list(dev.tensors.keys())}"
+                    )
                 continue
             local_ctx = {op.a: a, op.b: b}
             result = op.apply(local_ctx)
@@ -187,6 +247,10 @@ class MultiDeviceExecutor:
         for did, dev in self.devices.items():
             x = dev.get(op.input_names[0])
             if x is None:
+                warnings.warn(
+                    f"{type(op).__name__}: input '{op.input_names[0]}' not found on "
+                    f"device {did}. Skipping op. Available: {list(dev.tensors.keys())}"
+                )
                 continue
             local_ctx = {op.input_names[0]: x}
             result = op.apply(local_ctx)
@@ -232,7 +296,9 @@ class MultiDeviceExecutor:
         x = src_dev.get(op.x)
         if x is None:
             raise ValueError(
-                f"Send: tensor '{op.x}' not found on device {op.src}"
+                f"Send: tensor '{op.x}' not found on source device {op.src} "
+                f"(dst={op.dst}). Available tensors on device {op.src}: "
+                f"{list(src_dev.tensors.keys())}"
             )
 
         # Copy to dst device

@@ -237,13 +237,45 @@ class Add(IROp):
         a = ctx[self.a]
         b = ctx[self.b]
 
-        out_global = a.global_shape
-        out_spec = a.sharding  # inherit from a
-        out_local = a.local_shape
+        if a.global_shape != b.global_shape:
+            raise ValueError(
+                f"Add: shape mismatch between '{self.a}' {a.global_shape} and "
+                f"'{self.b}' {b.global_shape}. "
+                f"Element-wise ops require both inputs to have the same global shape. "
+                f"Op: Add({self.a}, {self.b}) -> {self.output}"
+            )
+
+        if a.sharding.mesh != b.sharding.mesh:
+            raise ValueError(
+                f"Add: mesh mismatch between '{self.a}' {a.sharding.mesh} and "
+                f"'{self.b}' {b.sharding.mesh}. "
+                f"Op: Add({self.a}, {self.b}) -> {self.output}"
+            )
+
+        out_placements = []
+        for mesh_dim, (pa, pb) in enumerate(zip(a.sharding.placements, b.sharding.placements)):
+            if isinstance(pa, Replicate):
+                out_placements.append(pb)
+            elif isinstance(pb, Replicate):
+                out_placements.append(pa)
+            elif type(pa) is type(pb) and isinstance(pa, Shard) and pa.dim == pb.dim:
+                out_placements.append(pa)
+            elif type(pa) is type(pb) and isinstance(pa, Partial):
+                out_placements.append(pa)
+            else:
+                raise ValueError(
+                    f"Add: incompatible placements at mesh dim {mesh_dim}: "
+                    f"'{self.a}' has {pa}, '{self.b}' has {pb}. "
+                    f"Element-wise ops require matching sharding, or one input to be Replicate. "
+                    f"Op: Add({self.a}, {self.b}) -> {self.output}"
+                )
+
+        out_spec = ShardingSpec(placements=tuple(out_placements), mesh=a.sharding.mesh)
+        out_local = compute_local_shape(a.global_shape, out_spec)
 
         result = TensorState(
             name=self.output,
-            global_shape=out_global,
+            global_shape=a.global_shape,
             local_shape=out_local,
             sharding=out_spec,
             expr=f"({a.expr} + {b.expr})" if a.expr and b.expr else "",
@@ -300,12 +332,47 @@ class Multiply(IROp):
     def apply(self, ctx: Dict[str, TensorState]) -> TensorState:
         a = ctx[self.a]
         b = ctx[self.b]
-        out_spec = a.sharding
+
+        if a.global_shape != b.global_shape:
+            raise ValueError(
+                f"Multiply: shape mismatch between '{self.a}' {a.global_shape} and "
+                f"'{self.b}' {b.global_shape}. "
+                f"Element-wise ops require both inputs to have the same global shape. "
+                f"Op: Multiply({self.a}, {self.b}) -> {self.output}"
+            )
+
+        if a.sharding.mesh != b.sharding.mesh:
+            raise ValueError(
+                f"Multiply: mesh mismatch between '{self.a}' {a.sharding.mesh} and "
+                f"'{self.b}' {b.sharding.mesh}. "
+                f"Op: Multiply({self.a}, {self.b}) -> {self.output}"
+            )
+
+        out_placements = []
+        for mesh_dim, (pa, pb) in enumerate(zip(a.sharding.placements, b.sharding.placements)):
+            if isinstance(pa, Replicate):
+                out_placements.append(pb)
+            elif isinstance(pb, Replicate):
+                out_placements.append(pa)
+            elif type(pa) is type(pb) and isinstance(pa, Shard) and pa.dim == pb.dim:
+                out_placements.append(pa)
+            elif type(pa) is type(pb) and isinstance(pa, Partial):
+                out_placements.append(pa)
+            else:
+                raise ValueError(
+                    f"Multiply: incompatible placements at mesh dim {mesh_dim}: "
+                    f"'{self.a}' has {pa}, '{self.b}' has {pb}. "
+                    f"Element-wise ops require matching sharding, or one input to be Replicate. "
+                    f"Op: Multiply({self.a}, {self.b}) -> {self.output}"
+                )
+
+        out_spec = ShardingSpec(placements=tuple(out_placements), mesh=a.sharding.mesh)
+        out_local = compute_local_shape(a.global_shape, out_spec)
 
         result = TensorState(
             name=self.output,
             global_shape=a.global_shape,
-            local_shape=a.local_shape,
+            local_shape=out_local,
             sharding=out_spec,
             expr=f"({a.expr} * {b.expr})" if a.expr and b.expr else "",
             requires_grad=a.requires_grad or b.requires_grad,
@@ -439,7 +506,12 @@ class AllReduce(IROp):
         x = ctx[self.x]
         if not x.partial:
             raise ValueError(
-                f"AllReduce requires PARTIAL input, got {x.sharding} for {x.name}"
+                f"AllReduce requires PARTIAL input for tensor '{x.name}', "
+                f"got placements={x.sharding.placements} (shape={x.global_shape}, "
+                f"local_shape={x.local_shape}). "
+                f"AllReduce on a non-PARTIAL tensor is a no-op or indicates "
+                f"a missing collective. "
+                f"Op: AllReduce({self.x}) -> {self.output}"
             )
 
         # AllReduce converts Partial → Replicate (on the partial mesh dim)
@@ -1178,7 +1250,10 @@ class AllReduceAsync(IROp):
         x = ctx[self.x]
         if not x.partial:
             raise ValueError(
-                f"AllReduceAsync requires PARTIAL input, got {x.sharding}"
+                f"AllReduceAsync requires PARTIAL input for tensor '{x.name}', "
+                f"got placements={x.sharding.placements} (shape={x.global_shape}, "
+                f"local_shape={x.local_shape}). "
+                f"Op: AllReduceAsync({self.x}) -> {self.output}"
             )
         new_placements = []
         for p in x.sharding.placements:
@@ -1514,6 +1589,21 @@ class Program:
 
     def __getitem__(self, idx):
         return self.ops[idx]
+
+    def validate_names(self) -> List[str]:
+        """Check for duplicate output names in the op sequence."""
+        errors: List[str] = []
+        seen: Dict[str, int] = {}
+        for i, op in enumerate(self.ops):
+            oname = op.output_name
+            if oname in seen:
+                errors.append(
+                    f"Duplicate output name '{oname}': "
+                    f"op[{i}] ({type(op).__name__}) conflicts with "
+                    f"op[{seen[oname]}] ({type(self.ops[seen[oname]]).__name__})"
+                )
+            seen[oname] = i
+        return errors
 
     def __repr__(self):
         ops_str = "\n  ".join(repr(op) for op in self.ops)
