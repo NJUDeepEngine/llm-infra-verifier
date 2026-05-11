@@ -718,13 +718,309 @@ class OverflowRiskDetector:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 6. Top-level numerical verifier
+# 6. Error Accumulation Model — how errors compound over training steps
 # ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class AccumulationPath:
+    """Models one pathway of error accumulation over training steps.
+
+    Three independent pathways with different accumulation dynamics:
+
+    Path 1 — Weight Cast Drift (per-step, NO memory):
+      fp32_master → fp16_weight each step independent → error bounded by
+      ε_cast regardless of T. Like rounding a number T times: each time
+      you round from the same fp32 source, you get the same fp16 result.
+
+    Path 2 — Optimizer State EMA (exponential memory, bounded steady-state):
+      m_t = β1·m_{t-1} + (1-β1)·g_t (noisy)
+      Steady-state error in m ≈ error in g. EMA neither amplifies nor
+      attenuates (it converges to the input mean).
+
+    Path 3 — Cross-Rank Divergence (linear accumulation, UNBOUNDED):
+      If AllReduce does not produce bit-exact gradients across ranks:
+        θ_t[r] ≠ θ_t[s]
+      Then the weight difference grows linearly with T:
+        |Δθ_T| ≈ T · lr · ε_ar · |g_typical|
+      This is the MOST DANGEROUS pathway.
+    """
+    name: str
+    accumulation_type: str  # "none", "ema_bounded", "linear_unbounded"
+    per_step_error: float    # ε introduced each step
+    steady_state_bound: float  # max error after T → ∞
+    divergence_rate: float   # per-step growth (for linear paths)
+
+
+@dataclass
+class AccumulationAnalysis:
+    """Complete error accumulation analysis over T training steps.
+
+    Models all three error pathways and their interaction.
+    """
+    # Configuration
+    num_steps: int
+    learning_rate: float
+    compute_dtype: Dtype
+    accumulate_dtype: Dtype
+    n_ranks: int
+    allreduce_topology: str
+
+    # Per-step error sources
+    same_precision_error: float      # AllReduce non-associativity, same dtype
+    cross_precision_error: float     # fp32→fp16 cast
+    gradient_noise: float            # batch sampling noise (data-dependent, upper bound)
+
+    # Accumulation paths
+    weight_cast_drift: AccumulationPath
+    optimizer_state_ema: AccumulationPath
+    cross_rank_divergence: AccumulationPath
+
+    # Final bounds after T steps
+    total_weight_error: float        # max |θ_T_actual - θ_T_ideal|
+    cross_rank_weight_diff: float    # max |θ_T[r] - θ_T[s]|
+    adam_state_error: float          # max |m_T_actual - m_T_ideal|
+
+    @property
+    def is_safe(self) -> bool:
+        """Training is safe if cross-rank divergence < 1% after T steps."""
+        return self.cross_rank_weight_diff < 0.01
+
+    @property
+    def risk_level(self) -> str:
+        diff = self.cross_rank_weight_diff
+        if diff > 0.1:
+            return "CRITICAL (cross-rank divergence > 10%)"
+        if diff > 0.01:
+            return "HIGH (cross-rank divergence > 1%)"
+        if diff > 0.001:
+            return "MEDIUM (cross-rank divergence > 0.1%)"
+        return "SAFE"
+
+    def summary(self) -> str:
+        lines = [
+            f"AccumulationAnalysis(T={self.num_steps}, lr={self.learning_rate})",
+            f"",
+            f"  Per-step error sources:",
+            f"    Same-precision (AllReduce):  {self.same_precision_error:.2e}",
+            f"    Cross-precision (cast):       {self.cross_precision_error:.2e}",
+            f"    Gradient noise (upper bound): {self.gradient_noise:.2e}",
+            f"",
+            f"  Accumulation pathways:",
+            f"    {self.weight_cast_drift.name}:",
+            f"      type={self.weight_cast_drift.accumulation_type}",
+            f"      per_step={self.weight_cast_drift.per_step_error:.2e}",
+            f"      steady_state={self.weight_cast_drift.steady_state_bound:.2e}",
+            f"    {self.optimizer_state_ema.name}:",
+            f"      type={self.optimizer_state_ema.accumulation_type}",
+            f"      per_step={self.optimizer_state_ema.per_step_error:.2e}",
+            f"      steady_state={self.optimizer_state_ema.steady_state_bound:.2e}",
+            f"    {self.cross_rank_divergence.name}:",
+            f"      type={self.cross_rank_divergence.accumulation_type}",
+            f"      per_step={self.cross_rank_divergence.per_step_error:.2e}",
+            f"      divergence_rate={self.cross_rank_divergence.divergence_rate:.2e}",
+            f"",
+            f"  After T={self.num_steps} steps:",
+            f"    Weight cast drift (path 1):        {self.total_weight_error:.2e}",
+            f"    Adam state error (path 2):         {self.adam_state_error:.2e}",
+            f"    Cross-rank divergence (path 3):    {self.cross_rank_weight_diff:.2e}",
+            f"",
+            f"  Risk level: {self.risk_level}",
+        ]
+        return "\n".join(lines)
+
+
+class ErrorAccumulator:
+    """Models how floating-point errors accumulate across training steps.
+
+    Three independent pathways (backed by mathematical analysis):
+
+    Path 1 — Weight Cast Drift:
+      Per-step fp32_master → fp16_weight cast. Each step is independent
+      (same fp32 input → same fp16 output, no memory).
+      Bound: |δ| ≤ ε_cast = 0.5 * 2^(-m_dst), INDEPENDENT of T.
+
+    Path 2 — Optimizer State EMA:
+      m_t = β1·m_{t-1} + (1-β1)·g_t. The EMA filter has steady-state
+      error equal to the input error. No amplification, no attenuation.
+      Bound: |m_error| ≤ |g_error|, INDEPENDENT of T.
+
+    Path 3 — Cross-Rank Divergence:
+      If AllReduce(g_t) is not bit-exact across ranks (due to non-associativity
+      or fp16 intermediate rounding), each rank gets slightly different g_t.
+      The weight difference accumulates LINEARLY with T:
+        |θ_T[r] - θ_T[s]| ≈ T · lr · ε_ar · |g_typical|
+      This is UNBOUNDED and the most dangerous pathway.
+
+      Key insight: fp16 AllReduce makes this MUCH worse:
+        fp32 AR: ε_ar ≈ 1e-7·logN → divergence after 10000 steps ≈ 1e-7
+        fp16 AR: ε_ar ≈ 1e-3·logN  → divergence after 10000 steps ≈ 1e-3
+    """
+
+    def __init__(
+        self,
+        compute_dtype: Dtype = Dtype.FP16,
+        accumulate_dtype: Dtype = Dtype.FP32,
+        n_ranks: int = 8,
+        allreduce_topology: str = "tree",
+    ):
+        self.compute_dtype = compute_dtype
+        self.accumulate_dtype = accumulate_dtype
+        self.n_ranks = n_ranks
+        self.allreduce_topology = allreduce_topology
+        self.error_model = ErrorModel(compute_dtype, accumulate_dtype)
+
+    def analyze(
+        self,
+        num_steps: int = 10000,
+        learning_rate: float = 1e-4,
+        typical_grad_magnitude: float = 1e-3,
+    ) -> AccumulationAnalysis:
+        """Compute error accumulation bounds over T training steps.
+
+        Args:
+            num_steps: number of training steps
+            learning_rate: Adam learning rate
+            typical_grad_magnitude: typical |g| for a weight element
+        """
+        # ── Per-step error sources ────────────────────────────────────────
+        # Same-precision: AllReduce non-associativity within accumulate dtype
+        ar_error = self.error_model.allreduce_error(
+            self.n_ranks, self.allreduce_topology, typical_grad_magnitude,
+        )
+
+        # This error comes from fp32 accumulation (usually)
+        # If accumulate_dtype is fp32: ε_same ≈ 1e-7 * logN → 3e-7 for N=8
+        same_precision_err = ar_error.relative
+
+        # Cross-precision: fp32→fp16 cast for forward pass
+        cast_err = self.error_model.cast_error(self.accumulate_dtype, self.compute_dtype)
+        cross_precision_err = cast_err.relative
+
+        # Gradient noise: batch sampling variance, data-dependent
+        # Upper bound: 1/√(batch_size) for normalized inputs
+        # We use a conservative structural bound
+        gradient_noise = 1.0 / math.sqrt(128)  # typical batch 128 per GPU
+
+        # ── Path 1: Weight Cast Drift (no memory) ─────────────────────────
+        # Each step: fp32_master → fp16_weight
+        # Independent: same fp32 → same fp16 every time
+        # Error is bounded by ε_cast regardless of T
+        weight_drift = AccumulationPath(
+            name="Weight Cast Drift (fp32→fp16, per-step independent)",
+            accumulation_type="none",
+            per_step_error=cross_precision_err,
+            steady_state_bound=cross_precision_err,  # bounded, not growing
+            divergence_rate=0.0,  # no accumulation
+        )
+
+        # ── Path 2: Optimizer State EMA (bounded steady-state) ────────────
+        # m_t = β1·m_{t-1} + (1-β1)·(g_true + ε_g)
+        # Steady state: m → E[g] + E[ε_g]
+        # The EMA converges to the input mean including its error
+        # Error = same_precision_err + gradient_noise (added, not multiplied)
+        optimizer_error = same_precision_err + gradient_noise * typical_grad_magnitude
+        # Upper bound after many steps: converges to this value
+        beta1 = 0.9
+        steady_state_factor = 1.0 / (1.0 - beta1)  # ≈ 10, EMA memory
+        # The EMA does NOT amplify error — it converges to the input mean
+        # However it takes β1/(1-β1) ≈ 9 steps to reach steady state
+        adam_state_ss = optimizer_error  # steady state = input error
+
+        optimizer_path = AccumulationPath(
+            name="Adam State EMA (m_t, v_t, bounded steady-state)",
+            accumulation_type="ema_bounded",
+            per_step_error=optimizer_error,
+            steady_state_bound=adam_state_ss,
+            divergence_rate=0.0,  # EMA converges, doesn't diverge
+        )
+
+        # ── Path 3: Cross-Rank Divergence (LINEARLY UNBOUNDED) ────────────
+        # Each step: AllReduce(g_i[r]) ≈ AllReduce(g_i[s]) but NOT bit-exact
+        # g_diff = g[r] - g[s] ≈ ε_ar * |g|
+        # θ_{t+1}[r] - θ_{t+1}[s] = (θ_t[r] - θ_t[s]) - lr * Adam'(g_diff)
+        #
+        # Key: if Adam(g) is roughly linear near the true gradient:
+        #   Δθ_t ≈ Δθ_{t-1} - lr * (g_t[r] - g_t[s])
+        #        = Δθ_{t-1} - lr * ε_ar * |g|
+        #   |Δθ_T| ≈ T * lr * ε_ar * |g_typical|
+
+        # The per-step divergence injection:
+        # For fp32 accumulate: ε_ar ≈ 1e-7 * logN (tiny)
+        # For fp16 accumulate: ε_ar ≈ 1e-3 * logN (significant!)
+        if self.accumulate_dtype == Dtype.FP16:
+            # fp16 accumulation → AllReduce uses fp16 intermediate
+            # Error ~ fp16_epsilon * logN ≈ 1e-3 * 3 ≈ 3e-3 per step
+            ar_divergence_per_step = (
+                DTYPE_PROPS[Dtype.FP16].machine_epsilon *
+                math.ceil(math.log2(self.n_ranks))
+            )
+        else:
+            # fp32 accumulation → AllReduce uses fp32 intermediate
+            # Error ~ fp32_epsilon * logN ≈ 1e-7 * 3 ≈ 3e-7 per step
+            ar_divergence_per_step = same_precision_err
+
+        # Cross-rank divergence per step = AR non-exactness * lr * |g|
+        per_step_divergence = learning_rate * ar_divergence_per_step * typical_grad_magnitude
+
+        # Linear accumulation over T steps
+        total_divergence = num_steps * per_step_divergence
+
+        cross_rank_path = AccumulationPath(
+            name="Cross-Rank Weight Divergence (AllReduce non-exact, LINEAR)",
+            accumulation_type="linear_unbounded",
+            per_step_error=ar_divergence_per_step,
+            steady_state_bound=float('inf'),  # no bound — grows with T
+            divergence_rate=per_step_divergence,
+        )
+
+        # Total weight error = cast drift + cross-rank (additive, independent)
+        total_weight_err = weight_drift.steady_state_bound + total_divergence
+
+        return AccumulationAnalysis(
+            num_steps=num_steps,
+            learning_rate=learning_rate,
+            compute_dtype=self.compute_dtype,
+            accumulate_dtype=self.accumulate_dtype,
+            n_ranks=self.n_ranks,
+            allreduce_topology=self.allreduce_topology,
+            same_precision_error=same_precision_err,
+            cross_precision_error=cross_precision_err,
+            gradient_noise=gradient_noise,
+            weight_cast_drift=weight_drift,
+            optimizer_state_ema=optimizer_path,
+            cross_rank_divergence=cross_rank_path,
+            total_weight_error=total_weight_err,
+            cross_rank_weight_diff=total_divergence,
+            adam_state_error=adam_state_ss,
+        )
+
+    def compare_configs(
+        self,
+        configs: List[Tuple[str, Dtype, Dtype]],  # [(name, compute, accumulate)]
+        num_steps: int = 10000,
+        learning_rate: float = 1e-4,
+    ) -> Dict[str, AccumulationAnalysis]:
+        """Compare error accumulation across different precision configs.
+
+        Example:
+            configs = [
+                ("fp16+f32 AR", Dtype.FP16, Dtype.FP32),
+                ("fp16+fp16 AR", Dtype.FP16, Dtype.FP16),
+                ("bf16+f32 AR", Dtype.BF16, Dtype.FP32),
+                ("fp32 all", Dtype.FP32, Dtype.FP32),
+            ]
+        """
+        results = {}
+        for name, comp, accum in configs:
+            acc = ErrorAccumulator(comp, accum, self.n_ranks, self.allreduce_topology)
+            results[name] = acc.analyze(num_steps, learning_rate)
+        return results
 
 @dataclass
 class NumericalVerifyResult:
     """Complete numerical verification result for a distributed training setup."""
     reduction_analysis: ReductionAnalysis
+    accumulation_analysis: AccumulationAnalysis
     optimizer_results: List[OptimizerCheckResult]
     overflow_risks: List[OverflowRisk]
     warnings: List[str]
@@ -740,16 +1036,19 @@ class NumericalVerifyResult:
             "  NUMERICAL VERIFICATION REPORT",
             "=" * 70,
             "",
-            "Reduction Analysis:",
+            "1. Reduction Error (per-step):",
             f"  {self.reduction_analysis}",
             "",
-            "Optimizer Invariants:",
+            "2. Error Accumulation (over training steps):",
+            f"  {self.accumulation_analysis.summary()}",
+            "",
+            "3. Optimizer Invariants:",
         ]
-        for r in self.optimizer_results[-1:]:  # show last step
+        for r in self.optimizer_results[-1:]:
             lines.append(f"  {r}")
         lines.extend([
             "",
-            "Overflow/Underflow Risks:",
+            "4. Overflow/Underflow Risks:",
         ])
         for risk in self.overflow_risks:
             lines.append(f"  {risk}")
@@ -833,8 +1132,29 @@ def verify_numerical(
         adam_warnings = detector.check_adam_state_precision()
         warnings.extend(adam_warnings)
 
+    # 5. Error accumulation over training steps
+    accumulator = ErrorAccumulator(compute_dtype, accumulate_dtype, n_ranks, topology)
+    accum_analysis = accumulator.analyze(
+        num_steps=10000, learning_rate=1e-4,
+        typical_grad_magnitude=1.0 / batch_size ** 0.5,
+    )
+
+    if accum_analysis.cross_rank_weight_diff > 0.01:
+        violations.append(
+            f"Cross-rank weight divergence after 10000 steps: "
+            f"{accum_analysis.cross_rank_weight_diff:.2e} (> 1% threshold). "
+            f"Consider using fp32 AllReduce accumulation."
+        )
+    elif accum_analysis.cross_rank_weight_diff > 0.001:
+        warnings.append(
+            f"Cross-rank weight divergence after 10000 steps: "
+            f"{accum_analysis.cross_rank_weight_diff:.2e} (0.1-1% range). "
+            f"Monitor for training instability."
+        )
+
     return NumericalVerifyResult(
         reduction_analysis=red_analysis,
+        accumulation_analysis=accum_analysis,
         optimizer_results=opt_results,
         overflow_risks=all_risks,
         warnings=warnings,

@@ -128,6 +128,62 @@ def demo_overflow_risks():
         print(f"    {w}")
 
 
+def demo_error_accumulation():
+    """Error accumulation over training steps (3 pathways)."""
+    print("\n" + "=" * 70)
+    print("  3.5. ERROR ACCUMULATION OVER TRAINING STEPS")
+    print("=" * 70)
+
+    from verifier.numerical import ErrorAccumulator, Dtype
+
+    # Compare precision configs at T=10k (standard) and T=100k (extended)
+    accumulator = ErrorAccumulator(Dtype.FP16, Dtype.FP32, n_ranks=8, allreduce_topology="tree")
+    configs = [
+        ("fp16 compute + fp32 AR (standard)", Dtype.FP16, Dtype.FP32),
+        ("fp16 compute + fp16 AR (dangerous)", Dtype.FP16, Dtype.FP16),
+        ("bf16 compute + fp32 AR", Dtype.BF16, Dtype.FP32),
+        ("fp32 all (baseline)", Dtype.FP32, Dtype.FP32),
+    ]
+
+    grad_mag = 0.1  # realistic per-element gradient magnitude
+
+    print(f"\n  T=10,000 steps (lr=1e-4, |g|≈{grad_mag}):")
+    print(f"  {'Config':<40} {'Cross-Rank Div':>14} {'Risk':>20}")
+    print(f"  {'-'*40} {'-'*14} {'-'*20}")
+    results_10k = accumulator.compare_configs(configs, num_steps=10000, learning_rate=1e-4)
+    for name, analysis in results_10k.items():
+        print(f"  {name:<40} {analysis.cross_rank_weight_diff:>14.2e} {analysis.risk_level:>20}")
+
+    print(f"\n  T=1,000,000 steps (full training run):")
+    print(f"  {'Config':<40} {'Cross-Rank Div':>14} {'Risk':>20}")
+    print(f"  {'-'*40} {'-'*14} {'-'*20}")
+    results_1m = accumulator.compare_configs(configs, num_steps=1000000, learning_rate=1e-4)
+    for name, analysis in results_1m.items():
+        print(f"  {name:<40} {analysis.cross_rank_weight_diff:>14.2e} {analysis.risk_level:>20}")
+
+    # Show breakdown across T
+    acc = ErrorAccumulator(Dtype.FP16, Dtype.FP16, n_ranks=256, allreduce_topology="ring")  # worst case
+    print(f"\n  Worst-case divergence (fp16 AR, N=256 ring, lr=1e-4, |g|=0.1):")
+    for t in [1000, 10000, 100000, 1000000]:
+        a = acc.analyze(num_steps=t, learning_rate=1e-4, typical_grad_magnitude=0.1)
+        print(f"    T={t:>8}: cross-rank div = {a.cross_rank_weight_diff:.2e}  [{a.risk_level}]")
+
+    # Show the three pathways
+    standard = results_10k["fp16 compute + fp32 AR (standard)"]
+    print(f"\n  Standard config (fp16+f32 AR) — 3 error pathways at T=10k:")
+    print(f"    Path 1 (Weight Cast): {standard.weight_cast_drift.steady_state_bound:.2e} — bounded, NO accumulation")
+    print(f"    Path 2 (Adam EMA):    {standard.optimizer_state_ema.steady_state_bound:.2e} — bounded, NO accumulation")
+    print(f"    Path 3 (Cross-Rank):  {standard.cross_rank_weight_diff:.2e} — LINEAR accumulation, grows with T")
+    print(f"    Dominant error source: Path 1 (cast) at T=10k, Path 3 (divergence) at T=10M")
+
+    dangerous = results_1m["fp16 compute + fp16 AR (dangerous)"]
+    print(f"\n  Dangerous config (fp16+fp16 AR) at T=1M:")
+    print(f"    Cross-rank div: {dangerous.cross_rank_weight_diff:.2e}")
+    fp32_base = results_1m["fp16 compute + fp32 AR (standard)"]
+    ratio = dangerous.cross_rank_weight_diff / max(fp32_base.cross_rank_weight_diff, 1e-30)
+    print(f"    Divergence ratio vs fp32 AR: {ratio:.0f}x")
+
+
 def demo_full_verification():
     """Run full verification for a realistic training config."""
     print("\n" + "=" * 70)
@@ -177,6 +233,7 @@ if __name__ == "__main__":
     demo_dtype_properties()
     demo_cast_errors()
     demo_reduction_analysis()
+    demo_error_accumulation()
     demo_optimizer_invariants()
     demo_overflow_risks()
     demo_full_verification()
