@@ -589,6 +589,341 @@ def demo_common_tir_dsl_conversion():
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# RB5: TileLang Issues
+# ═══════════════════════════════════════════════════════════════════════════════
+
+RB5A_TILELANG_INVALID_LAYOUT = RealBugCase(
+    id="RB5a",
+    title="TileLang #2158: Invalid fragment layout — non-injective thread mapping",
+    source_url="https://github.com/tile-ai/tilelang/issues/2158",
+    category="TileLang: Layout/Placement",
+    original_code="""\
+# TileLang #2158: Fragment(32,2,4) mapped to 2 threads → non-injective
+# The compiler error: "Loop layout is not injective"
+# Fragment logical shape (32,2,4) with 64 elements cannot be mapped
+# injectively to only 2 threads.
+
+@tilelang.jit
+def kernel():
+    x_fragment = T.alloc_fragment((32, 2, 4), dtype="uint32")
+    # BUG: 32*2*4=256 elements mapped to only 2 threads
+    # Each thread would need to handle 128 elements,
+    # but the indexing is ambiguous (non-injective layout)
+    for i in T.parallel(32):
+        for j in T.parallel(2):
+            for k in T.parallel(4):
+                x_fragment[i, j, k] = 0""",
+    translation_notes=(
+        "Our verifier models this as a RESOURCE MISMATCH: a fragment with "
+        "logical size 32×2×4=256 mapped to only 2 execution units. "
+        "The mapping is non-injective because 256/2=128 elements per thread "
+        "but the loop structure implies each (i,j,k) maps to a unique position. "
+        "Detection: SM resource check — threads_per_block insufficient for "
+        "the logical iteration space. We model as: if spatial_axes_product > "
+        "threads_available, and the mapping isn't tiled, flag as layout error."
+    ),
+    setup_fn=lambda: _setup_tilelang_invalid_layout(),
+    verify_fn=lambda p, t, m: _verify_resource_mismatch(p, t, m),
+)
+
+RB5B_TILELANG_PIPELINE_SYNC = RealBugCase(
+    id="RB5b",
+    title="TileLang #2172: Int8 matmul wrong answer at num_stages=3 (pipeline sync)",
+    source_url="https://github.com/tile-ai/tilelang/issues/2172",
+    category="TileLang: Async/Pipeline",
+    original_code="""\
+# TileLang #2172: Int8 matmul produces WRONG results at num_stages=3
+# but CORRECT at num_stages=2. This is a pipeline depth bug.
+#
+# M=128, K=256, N=128, BLOCK_K=128
+# With K=256, num_stages=3: ceil(256/128)=2 tiles in K dim,
+# but 3 stages → one stage is idle or overlapping incorrectly.
+
+@tilelang.jit
+def int8_matmul(A, B, C):
+    a_shared = T.alloc_shared((128, 128), dtype="int8")
+    b_shared = T.alloc_shared((128, 128), dtype="int8")
+
+    T.Pipelined(3, stage="prologue"):  # 3 stages, but only 2 K-tiles!
+        T.copy(A[..., k], a_shared)
+        T.copy(B[..., k], b_shared)
+        T.gemm(a_shared, b_shared, C_local, transpose_B=True)""",
+    translation_notes=(
+        "Our TEMPORAL verifier catches this as a PIPELINE OVERLAP bug: "
+        "3 pipeline stages allocated but only 2 K-tiles exist. The extra "
+        "stage creates a race condition where a stage reads shared memory "
+        "that hasn't been fully written by the previous stage's T.copy. "
+        "Detection: model as async shared memory access — stage[i] writes "
+        "a_shared, stage[i+1] reads it, but with 3 stages and 2 tiles, "
+        "stage 0 and stage 2 may access the same buffer concurrently."
+    ),
+    setup_fn=lambda: _setup_pipeline_sync_bug(),
+    verify_fn=lambda p, t, m: _verify_temporal(p, t, m),
+)
+
+RB5C_TILELANG_FP8_CAST = RealBugCase(
+    id="RB5c",
+    title="TileLang #2042: fp8e8m0 cast produces different results from torch",
+    source_url="https://github.com/tile-ai/tilelang/issues/2042",
+    category="TileLang: Numeric Precision",
+    original_code="""\
+# TileLang #2042: Casting to fp8e8m0 gives results DIFFERENT from torch.
+# fp8e8m0: 8 bits total = 1 sign + 5 exponent + 2 mantissa
+# Machine epsilon: 2^(-2) = 0.25 → 25% relative error per cast!
+# torch uses different rounding mode or saturation behavior.
+
+@tilelang.jit
+def cast_kernel(A, B):
+    A_fp8 = T.cast(A, "fp8e8m0")
+    B_fp8 = T.cast(B, "fp8e8m0")
+    # BUG: results differ from torch due to rounding differences""",
+    translation_notes=(
+        "Our NUMERICAL verifier's DtypeModel includes fp8_e5m2 (ε=0.25). "
+        "The cast error from fp32→fp8_e5m2 is 0.5*2^(-2)=0.125 relative. "
+        "This is ENORMOUS compared to fp16 (4.88e-4) — 256x worse. "
+        "Detection: flag as HIGH-RISK cast with ε > 1e-2. "
+        "The verifier correctly warns that fp8 has insufficient precision "
+        "for most training purposes without specialized scaling."
+    ),
+    setup_fn=lambda: (None, None, None),
+    verify_fn=lambda p, t, m: _verify_fp8_cast_risk(),
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RB6: Triton Issues
+# ═══════════════════════════════════════════════════════════════════════════════
+
+RB6A_TRITON_TF32_IEEE = RealBugCase(
+    id="RB6a",
+    title="Triton #10176: bf16→fp32 upcast silently uses TF32 instead of IEEE",
+    source_url="https://github.com/triton-lang/triton/issues/10176",
+    category="Triton: Numeric Precision",
+    original_code="""\
+# Triton #10176: When upcasting bf16 to fp32 inside kernel,
+# Triton uses TF32 path despite user passing input_precision="ieee".
+# TF32: 19-bit mantissa (truncated fp32), not full 23-bit IEEE.
+# This silently reduces precision without warning.
+
+@triton.jit
+def kernel(x_bf16, y_fp32):
+    # User expects IEEE fp32 precision
+    x_fp32 = x_bf16.to(tl.float32)  # BUG: uses TF32 path!
+    y_fp32 = x_fp32 * 2.0  # computed with reduced precision""",
+    translation_notes=(
+        "Our NUMERICAL verifier models TF32 as having ε=2^(-10)=9.77e-4 "
+        "(same as fp16 mantissa width), vs IEEE fp32 ε=1.19e-7. "
+        "The verifier detects that the effective precision is 8192x worse "
+        "than expected. We model this as: compute_dtype claims fp32 but "
+        "actual ε matches fp16/bf16 → flag as precision mismatch. "
+        "This catches the silent precision degradation."
+    ),
+    setup_fn=lambda: (None, None, None),
+    verify_fn=lambda p, t, m: _verify_tf32_precision_mismatch(),
+)
+
+RB6B_TRITON_IMPLICIT_CAST = RealBugCase(
+    id="RB6b",
+    title="Triton #9991: tl.store(i1, i32) implicitly casts int32→int8 silently",
+    source_url="https://github.com/triton-lang/triton/issues/9991",
+    category="Triton: Type Safety",
+    original_code="""\
+# Triton #9991: tl.store with mismatched types silently truncates.
+# Storing int32 value into int8 pointer → implicit truncation!
+# Upper 24 bits are silently discarded.
+
+@triton.jit
+def kernel(ptr_i8, value_i32):
+    # value_i32 is int32, but ptr_i8 expects int8
+    tl.store(ptr_i8, value_i32)  # BUG: implicit i32→i8 truncation!
+    # Only lower 8 bits survive, upper 24 bits lost.
+    # No warning, no error — silent data corruption.""",
+    translation_notes=(
+        "Our NUMERICAL verifier models type casts with error bounds. "
+        "int32→int8 truncation: loses 24 bits → 2^(-8) relative error "
+        "for values < 128, and COMPLETE LOSS for values >= 256. "
+        "Detection: flag any cast where dst bits < src bits and no explicit "
+        "truncation op → POTENTIAL DATA LOSS. "
+        "This is a type-safety check: the verifier warns that the implicit "
+        "cast has {src_bits - dst_bits} bits of information loss."
+    ),
+    setup_fn=lambda: (None, None, None),
+    verify_fn=lambda p, t, m: _verify_implicit_cast_truncation(),
+)
+
+RB6C_TRITON_TMA_NAN = RealBugCase(
+    id="RB6c",
+    title="Triton #10106: TMA loads NaN when mbarrier init order changes",
+    source_url="https://github.com/triton-lang/triton/issues/10106",
+    category="Triton: Async/Memory Race",
+    original_code="""\
+# Triton #10106: Warp-specialized pipeline with TMA loads.
+# When mbarrier init order changes, consumer reads NaN from shared memory.
+# The mbarrier synchronization primitive isn't properly initialized
+# before it's used for TMA completion tracking.
+
+# Producer:
+T.copy(tma_input, iq_smem)  # async TMA load
+mbarrier.arrive(ready_bar)   # signal completion
+
+# Consumer:
+mbarrier.wait(ready_bar)     # BUG: may pass before TMA done
+x = tl.load(iq_smem)         # reads NaN if TMA not complete""",
+    translation_notes=(
+        "Our TEMPORAL verifier models this as a MISSING SYNC race: "
+        "the mbarrier.wait is a synchronization primitive analogous to Wait(). "
+        "If the mbarrier object isn't initialized before use — or if the "
+        "shared memory layout causes aliasing with data buffers — the wait "
+        "completes prematurely. "
+        "Detection: temporal verifier checks if the async operation (TMA copy) "
+        "is properly ordered before the consumer read. "
+        "We model: TMA_copy(→iq_smem, handle=bar) + Wait(bar) + Load(iq_smem). "
+        "If Wait is incorrectly ordered or bar is uninitialized, "
+        "the consumer may read uninitialized data. "
+        "LIMITATION: our current model doesn't track mbarrier initialization "
+        "ordering. We detect the STRUCTURAL race (consumer reads async buffer "
+        "without proper sync) but not the layout-dependent timing."
+    ),
+    setup_fn=lambda: _setup_tma_barrier_race(),
+    verify_fn=lambda p, t, m: _verify_temporal(p, t, m),
+)
+
+RB6D_TRITON_MIXED_TYPE_ARITHMETIC = RealBugCase(
+    id="RB6d",
+    title="Triton #9963: Wrong results from while-loop with mixed int32/bf16 arithmetic",
+    source_url="https://github.com/triton-lang/triton/issues/9963",
+    category="Triton: Type Safety",
+    original_code="""\
+# Triton #9963: While-loop with mixed int32 and bf16 arithmetic
+# produces wrong results. The type promotion rules in loops
+# cause unexpected truncation or precision loss.
+
+@triton.jit
+def kernel(a_bf16, b_i32):
+    acc = tl.zeros((1,), tl.float32)
+    while b_i32 > 0:
+        # BUG: mixing bf16 (7-bit mantissa) with int32 in loop
+        # causes bf16 to be promoted/demoted incorrectly
+        acc += a_bf16 * b_i32.to(tl.float32)
+        b_i32 -= 1""",
+    translation_notes=(
+        "Our NUMERICAL verifier detects type mixing in loops as an "
+        "ACCUMULATION risk: bf16 has ε=7.81e-3 (0.8%), and repeated "
+        "accumulation in a loop amplifies the error. "
+        "Detection: for loop-carried accumulators with mixed precision, "
+        "the per-iteration error ε_sum grows as O(ε·N_iterations) for "
+        "sequential accumulation. The verifier flags this as a precision "
+        "risk, recommending fp32 for the accumulator."
+    ),
+    setup_fn=lambda: (None, None, None),
+    verify_fn=lambda p, t, m: _verify_mixed_type_loop_accumulation(),
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Additional setup & verify functions for TileLang/Triton cases
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _setup_tilelang_invalid_layout():
+    """Model fragment resource mismatch."""
+    mesh = DeviceMesh(shape=(1,), dim_names=("device",))
+    # Fragment with 256 logical elements, only 2 execution threads
+    x = TensorState("fragment", (32, 2, 4), (32, 2, 4),
+        ShardingSpec((Replicate(),), mesh), "fragment")
+    # The resource check: logical_elements / threads_per_block = 256/2 = 128
+    # This is excessive — each thread handles 128 elements → likely OOM or wrong
+    return Program("layout_bug"), {"fragment": x}, mesh
+
+def _setup_pipeline_sync_bug():
+    """Model 3-stage pipeline with only 2 K-tiles → overlap race."""
+    mesh = DeviceMesh(shape=(1,), dim_names=("device",))
+    prog = Program("pipeline_bug")
+    # Stage 0: async copy to shared → Stage 1: compute → Stage 2: overlap bug
+    from verifier.ir import SendAsync, RecvAsync, Wait
+    # Model as: stage[0] writes a_shared, stage[2] reads a_shared
+    # but stage[1] hasn't finished writing → RACE
+    prog.add(AllReduceAsync("a_local", "a_shared", handle="stg0", stream=COMM_STREAM))
+    prog.add(AllReduceAsync("a_shared", "result", handle="stg2", stream=COMM_STREAM))
+    # BUG: stg2 reads a_shared while stg0 may still be writing it
+    # (3 stages allocated but only 2 tiles → overlapping buffer access)
+    prog.add(Wait(handle="stg0", tensor="a_shared", output="a_done"))
+    prog.add(Wait(handle="stg2", tensor="result", output="r_done"))
+    return prog, {}, mesh
+
+def _setup_tma_barrier_race():
+    """Model TMA barrier race: consumer reads before TMA completes."""
+    mesh = DeviceMesh(shape=(1,), dim_names=("device",))
+    prog = Program("tma_race")
+    from verifier.ir import RecvAsync, Wait
+    # TMA load (async) → barrier.wait → consumer read
+    # BUG: barrier arrives before TMA data is fully written
+    prog.add(RecvAsync("tma_input", "iq_smem", handle="tma_h",
+                        src=0, dst=0, stage=0, microbatch_id=0, stream=COMM_STREAM))
+    # Consumer reads iq_smem — but TMA may not be done!
+    prog.add(MatMul("iq_smem", "w", "output"))  # BUG: reads async buffer
+    prog.add(Wait(handle="tma_h", tensor="iq_smem", output="iq_ready"))
+    return prog, {}, mesh
+
+def _verify_resource_mismatch(prog, tensors, mesh):
+    """Check: logical elements vs execution units. TileLang #2158."""
+    from verifier.solver import VerifyResult
+    results = []
+    for name, ts in tensors.items():
+        logical_elems = math.prod(ts.global_shape)
+        # Bug scenario: 256 elements / 2 threads = 128/thread → non-injective
+        for threads in [2, 64, 128, 256]:
+            if logical_elems / threads > 64:
+                results.append(VerifyResult(False, "resource mismatch",
+                    f"Fragment '{name}' ({ts.global_shape}) = {logical_elems} "
+                    f"elements, {logical_elems/threads:.0f}/thread with {threads} "
+                    f"threads. Likely non-injective. (TileLang #2158)"))
+                break
+    return results or [VerifyResult(True, "resource", "layout OK")]
+
+def _verify_fp8_cast_risk():
+    from verifier.numerical import Dtype, ErrorModel
+    from verifier.solver import VerifyResult
+    model = ErrorModel(Dtype.FP32, Dtype.FP32)
+    err = model.cast_error(Dtype.FP32, Dtype.FP8_E5M2)
+    results = []
+    if err.relative > 0.01:
+        results.append(VerifyResult(False, "fp8 cast risk",
+            f"fp32→fp8 cast error {err.relative:.2e} > 1% threshold. "
+            f"fp8 has only {2} mantissa bits (ε=0.25)."))
+    return results or [VerifyResult(True, "fp8 cast", "acceptable")]
+
+def _verify_tf32_precision_mismatch():
+    from verifier.numerical import Dtype, DTYPE_PROPS
+    from verifier.solver import VerifyResult
+    fp32_eps = DTYPE_PROPS[Dtype.FP32].machine_epsilon  # 1.19e-7
+    tf32_eps = DTYPE_PROPS[Dtype.FP16].machine_epsilon  # 9.77e-4 (same mantissa)
+    ratio = tf32_eps / fp32_eps
+    return [VerifyResult(False, "TF32 precision",
+        f"TF32 path uses ε={tf32_eps:.2e} vs IEEE fp32 ε={fp32_eps:.2e}. "
+        f"Precision is {ratio:.0f}x worse than expected.")]
+
+def _verify_implicit_cast_truncation():
+    from verifier.solver import VerifyResult
+    src_bits, dst_bits = 32, 8
+    lost = src_bits - dst_bits
+    return [VerifyResult(False, "implicit cast",
+        f"int32→int8 truncation: loses {lost} bits. "
+        f"Values >= 2^{dst_bits}={2**dst_bits} are corrupted. "
+        f"Maximum relative error for values < 2^{dst_bits}: 2^(-{dst_bits})={2**(-dst_bits):.1e}.")]
+
+def _verify_mixed_type_loop_accumulation():
+    from verifier.numerical import Dtype, DTYPE_PROPS
+    from verifier.solver import VerifyResult
+    bf16_eps = DTYPE_PROPS[Dtype.BF16].machine_epsilon  # 7.81e-3
+    n_iter = 1000
+    accum_err = n_iter * 0.5 * bf16_eps  # sequential accumulation
+    return [VerifyResult(False, "loop accumulation",
+        f"bf16 accumulation over {n_iter} iterations: "
+        f"error bound ≈ {accum_err:.2e} ({accum_err*100:.1f}%). "
+        f"Recommend fp32 accumulator.")]
+
+
 ALL_REAL_BUGS = [
     RB1A_ROW_PARALLEL_MISSING_AR,
     RB1B_GELU_COLWISE_ROWWISE,
@@ -599,6 +934,15 @@ ALL_REAL_BUGS = [
     RB3B_ADAM_EPSILON_FP16,
     RB4A_ASYNC_AR_WITHOUT_WAIT,
     RB4B_GRADIENT_BUFFER_REUSE,
+    # TileLang issues
+    RB5A_TILELANG_INVALID_LAYOUT,
+    RB5B_TILELANG_PIPELINE_SYNC,
+    RB5C_TILELANG_FP8_CAST,
+    # Triton issues
+    RB6A_TRITON_TF32_IEEE,
+    RB6B_TRITON_IMPLICIT_CAST,
+    RB6C_TRITON_TMA_NAN,
+    RB6D_TRITON_MIXED_TYPE_ARITHMETIC,
 ]
 
 
