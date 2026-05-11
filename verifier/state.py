@@ -192,6 +192,7 @@ class TensorState:
             microbatch_id=self.microbatch_id,
             is_activation=self.is_activation,
             cp_rank=self.cp_rank,
+            _async_handle=self._async_handle,
         )
 
     def grad_tensor(self, name: str = "") -> TensorState:
