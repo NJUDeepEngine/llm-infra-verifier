@@ -13,7 +13,52 @@ from typing import Optional, Tuple, Dict, List
 import math
 
 
-# ── Placement types ──────────────────────────────────────────────────────────
+# ── SPMD Local Type (R/I/V/P) — trust base from meta-pytorch/spmd_types ──────
+
+class LocalSPMDType(Enum):
+    """SPMD local types per mesh axis (from meta-pytorch/spmd_types DESIGN.md).
+
+    Four states with fixed forward↔backward duality:
+
+        REPLICATE (R): data same across ranks  →  gradient is PARTIAL
+        INVARIANT (I): data same across ranks  →  gradient is INVARIANT (no comm)
+        VARYING  (V): data differs per rank   →  gradient is VARYING
+        PARTIAL  (P): pending sum across ranks →  gradient is REPLICATE
+
+    Duality: R↔P, I↔I, V↔V. These are fixed by autograd.
+    """
+    REPLICATE = "R"
+    INVARIANT = "I"
+    VARYING = "V"
+    PARTIAL = "P"
+
+    def gradient_type(self) -> "LocalSPMDType":
+        """Return the gradient's local type (backward dual)."""
+        dual = {
+            LocalSPMDType.REPLICATE: LocalSPMDType.PARTIAL,
+            LocalSPMDType.INVARIANT: LocalSPMDType.INVARIANT,
+            LocalSPMDType.VARYING: LocalSPMDType.VARYING,
+            LocalSPMDType.PARTIAL: LocalSPMDType.REPLICATE,
+        }
+        return dual[self]
+
+
+# ── Global Partition Spec (per-dimension sharding) ────────────────────────────
+
+@dataclass(frozen=True)
+class Shard:
+    """Tensor dimension `dim` is sharded across a mesh axis.
+
+    This is a GLOBAL property — it describes how shards reassemble.
+    In SPMD terms: the PartitionSpec entry for this dimension.
+    """
+    dim: int
+
+    def __repr__(self):
+        return f"Shard({self.dim})"
+
+
+# ── Legacy Placement types (backward compatibility) ───────────────────────────
 
 class PlacementType(Enum):
     REPLICATE = "replicate"
@@ -22,17 +67,11 @@ class PlacementType(Enum):
 
 
 @dataclass(frozen=True)
-class Shard:
-    """Tensor is sharded along dimension `dim` across a mesh dimension."""
-    dim: int
-
-    def __repr__(self):
-        return f"Shard({self.dim})"
-
-
-@dataclass(frozen=True)
 class Replicate:
-    """Tensor is replicated across all devices in the mesh dimension."""
+    """DEPRECATED: use LocalSPMDType.REPLICATE instead.
+
+    Tensor is replicated across all devices in the mesh dimension.
+    """
 
     def __repr__(self):
         return "Replicate()"
@@ -40,7 +79,10 @@ class Replicate:
 
 @dataclass(frozen=True)
 class Partial:
-    """Tensor is partially reduced — needs AllReduce to become Replicate."""
+    """DEPRECATED: use LocalSPMDType.PARTIAL instead.
+
+    Tensor is partially reduced — needs AllReduce to become Replicate.
+    """
 
     def __repr__(self):
         return "Partial()"
@@ -139,15 +181,31 @@ class AccessPattern:
 class TensorState:
     """Symbolic tensor state on a single device.
 
-    Tracks placement, sharding, shape, symbolic expression, and autograd
-    / pipeline metadata.  This is the central data structure that flows
-    through the symbolic executor.
+    Two-layer type model (SPMD types from meta-pytorch/spmd_types):
+      - local_type: per-axis SPMD type (R/I/V/P) — LOCAL view
+      - partition_spec: optional ShardingSpec — GLOBAL reassembly info
+
+    For backward compatibility, the `sharding` and `placement` layer is
+    preserved and auto-derived from local_type + partition_spec.
     """
     name: str
     global_shape: Tuple[int, ...]          # shape before sharding
     local_shape: Tuple[int, ...]           # shape on this device after sharding
-    sharding: ShardingSpec                 # how the tensor is distributed
+    sharding: ShardingSpec                 # how the tensor is distributed (legacy, auto-derived)
     expr: str = ""                         # symbolic expression, e.g. "(x @ w)"
+
+    # ── SPMD type layer (new) ──
+    local_type: LocalSPMDType = field(default=None)  # auto-derived if None
+
+    def __post_init__(self):
+        """Auto-derive SPMD local_type from sharding if not explicitly set."""
+        if self.local_type is None:
+            if self.sharding.partial:
+                object.__setattr__(self, 'local_type', LocalSPMDType.PARTIAL)
+            elif not any(isinstance(p, Shard) for p in self.sharding.placements):
+                object.__setattr__(self, 'local_type', LocalSPMDType.REPLICATE)
+            else:
+                object.__setattr__(self, 'local_type', LocalSPMDType.VARYING)
 
     # Autograd
     requires_grad: bool = False
@@ -169,13 +227,54 @@ class TensorState:
     def is_async_in_flight(self) -> bool:
         return self._async_handle is not None
 
+    # ── SPMD type queries ──
+
+    @property
+    def is_replicate(self) -> bool:
+        return self.local_type == LocalSPMDType.REPLICATE
+
+    @property
+    def is_invariant(self) -> bool:
+        return self.local_type == LocalSPMDType.INVARIANT
+
+    @property
+    def is_varying(self) -> bool:
+        return self.local_type == LocalSPMDType.VARYING
+
+    @property
+    def is_partial(self) -> bool:
+        return self.local_type == LocalSPMDType.PARTIAL
+
+    @property
+    def gradient_type(self) -> LocalSPMDType:
+        """SPMD gradient type (R↔P, I↔I, V↔V)."""
+        return self.local_type.gradient_type()
+
+    # ── Legacy accessors (backward compat) ──
+
     @property
     def partial(self) -> bool:
-        return self.sharding.partial
+        """Legacy: true if type is PARTIAL."""
+        return self.is_partial
 
     @property
     def is_replicated(self) -> bool:
-        return all(isinstance(p, Replicate) for p in self.sharding.placements)
+        """Legacy: true if type is REPLICATE or INVARIANT."""
+        return self.is_replicate or self.is_invariant
+
+    # ── SPMD type helpers ──
+
+    def with_local_type(self, lt: LocalSPMDType) -> "TensorState":
+        """Return copy with different local SPMD type."""
+        return TensorState(
+            name=self.name, global_shape=self.global_shape,
+            local_shape=self.local_shape, sharding=self.sharding,
+            expr=self.expr, local_type=lt,
+            requires_grad=self.requires_grad, grad=self.grad,
+            grad_name=self.grad_name, stage=self.stage,
+            microbatch_id=self.microbatch_id, is_activation=self.is_activation,
+            cp_rank=self.cp_rank, _async_handle=self._async_handle,
+        )
 
     def with_name(self, name: str) -> TensorState:
         """Return a copy with a different name."""

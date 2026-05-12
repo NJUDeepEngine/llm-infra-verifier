@@ -345,17 +345,38 @@ class AutogradEngine:
         )
 
     def _is_dual(self, fwd_op: IROp, bwd_op: IROp) -> bool:
-        """Check if bwd_op is the dual of fwd_op."""
+        """Check if bwd_op is the dual of fwd_op (SPMD gradient duality rules).
+
+        SPMD duality (from spmd_types DESIGN.md):
+          Collective:  AllReduce ↔ AllReduce, AllGather ↔ ReduceScatter, Send ↔ Recv
+          SPMD types:  R↔P, I↔I, V↔V  (fixed by autograd)
+          Reinterpret: reverse the type transition
+          Convert:     reverse the type transition
+        """
+        # Collective ops
         if isinstance(fwd_op, AllReduce) and isinstance(bwd_op, AllReduce):
             return True
         if isinstance(fwd_op, AllGather) and isinstance(bwd_op, ReduceScatter):
             return fwd_op.gather_dim == bwd_op.scatter_dim
         if isinstance(fwd_op, ReduceScatter) and isinstance(bwd_op, AllGather):
             return fwd_op.scatter_dim == bwd_op.gather_dim
+
+        # P2P
         if isinstance(fwd_op, Send) and isinstance(bwd_op, Recv):
             return fwd_op.src == bwd_op.dst and fwd_op.dst == bwd_op.src
         if isinstance(fwd_op, Recv) and isinstance(bwd_op, Send):
             return fwd_op.src == bwd_op.dst and fwd_op.dst == bwd_op.src
+
+        # SPMD type manipulation
+        from .ir import Reinterpret, Convert
+        if isinstance(fwd_op, Reinterpret) and isinstance(bwd_op, Reinterpret):
+            # Backward reverses the type transition
+            return (fwd_op.src_type == bwd_op.dst_type and
+                    fwd_op.dst_type == bwd_op.src_type)
+        if isinstance(fwd_op, Convert) and isinstance(bwd_op, Convert):
+            return (fwd_op.src_type == bwd_op.dst_type and
+                    fwd_op.dst_type == bwd_op.src_type)
+
         return False
 
     def get_gradient(self, tensor_name: str) -> Optional[TensorState]:
