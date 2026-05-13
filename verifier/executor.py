@@ -100,6 +100,12 @@ class MultiDeviceExecutor:
     simulating collective communication.
     """
     mesh: DeviceMesh
+    spmd_checking: bool = False
+
+    def _apply_op(self, op: IROp, ctx: Dict[str, TensorState]) -> TensorState:
+        if self.spmd_checking:
+            return op.apply_checked(ctx)
+        return op.apply(ctx)
 
     def __post_init__(self):
         self.devices: Dict[int, DeviceState] = {}
@@ -248,7 +254,7 @@ class MultiDeviceExecutor:
                     )
                 continue
             local_ctx = {op.a: a, op.b: b}
-            result = op.apply(local_ctx)
+            result = self._apply_op(op, local_ctx)
             dev.set(result)
 
             # Propagate slices: Y = A @ B → Y rows from A, Y cols from B
@@ -282,7 +288,7 @@ class MultiDeviceExecutor:
                     )
                 continue
             local_ctx = {op.a: a, op.b: b}
-            result = op.apply(local_ctx)
+            result = self._apply_op(op, local_ctx)
             dev.set(result)
             # Element-wise: inherit slice from whichever input is sharded
             sa = dev.get_slice(op.a)
@@ -307,7 +313,7 @@ class MultiDeviceExecutor:
                 )
                 continue
             local_ctx = {op.input_names[0]: x}
-            result = op.apply(local_ctx)
+            result = self._apply_op(op, local_ctx)
             dev.set(result)
             # Unary: inherit slice from input
             sx = dev.get_slice(op.input_names[0])
@@ -326,7 +332,7 @@ class MultiDeviceExecutor:
             if x is None:
                 continue
             local_ctx = {op.x: x}
-            result = op.apply(local_ctx)
+            result = self._apply_op(op, local_ctx)
             dev.set(result)
             # After AllReduce, every device holds the full tensor
             dev.set_slice(op.output, TensorSlice(
@@ -343,7 +349,7 @@ class MultiDeviceExecutor:
             if x is None:
                 continue
             local_ctx = {op.x: x}
-            result = op.apply(local_ctx)
+            result = self._apply_op(op, local_ctx)
             dev.set(result)
 
     def _exec_reducescatter(self, op: ReduceScatter):
@@ -353,7 +359,7 @@ class MultiDeviceExecutor:
             if x is None:
                 continue
             local_ctx = {op.x: x}
-            result = op.apply(local_ctx)
+            result = self._apply_op(op, local_ctx)
             dev.set(result)
 
     def _exec_send(self, op: Send):
@@ -412,7 +418,7 @@ class MultiDeviceExecutor:
             if q is None or k is None or v is None:
                 continue
             local_ctx = {op.q: q, op.k: k, op.v: v}
-            result = op.apply(local_ctx)
+            result = self._apply_op(op, local_ctx)
             dev.set(result)
             # Output inherits Q's slice
             sq = dev.get_slice(op.q)
@@ -431,14 +437,14 @@ class MultiDeviceExecutor:
             if x is None:
                 continue
             local_ctx = {op.x: x}
-            result = op.apply(local_ctx)
+            result = self._apply_op(op, local_ctx)
             dev.set(result)
 
     def _exec_sync(self, op):
         """Execute Wait/WaitAll on all devices."""
         for did, dev in self.devices.items():
             local_ctx = dict(dev.tensors)
-            result = op.apply(local_ctx)
+            result = self._apply_op(op, local_ctx)
             if result is not None:
                 dev.set(result)
             if isinstance(op, WaitAll):
@@ -457,7 +463,7 @@ class MultiDeviceExecutor:
         if x is None:
             return
         local_ctx = {op.x: x}
-        result = op.apply(local_ctx)
+        result = self._apply_op(op, local_ctx)
         dst_dev.set(result)
 
     def _exec_recv_async(self, op: RecvAsync):
@@ -467,7 +473,7 @@ class MultiDeviceExecutor:
             return
         x = dst_dev.get(op.x)
         local_ctx = {op.x: x} if x else {}
-        result = op.apply(local_ctx)
+        result = self._apply_op(op, local_ctx)
         dst_dev.set(result)
 
     def _exec_overlap(self, op: OverlapRegion):

@@ -874,5 +874,175 @@ class TestTemporal:
         assert result.is_safe, f"Sync AllReduce should be safe, got {result.summary()}"
 
 
+class TestSPMDTypeSystem:
+    """Tests for SPMD type propagation and cross-validation."""
+
+    def _mesh(self):
+        return DeviceMesh(shape=(2,), dim_names=("tp",))
+
+    def _tensor(self, name, placement, mesh=None):
+        mesh = mesh or self._mesh()
+        gs = (8, 16)
+        spec = ShardingSpec(placements=(placement,), mesh=mesh)
+        ls = compute_local_shape(gs, spec)
+        return TensorState(name=name, global_shape=gs, local_shape=ls, sharding=spec, expr=name)
+
+    # ── propagate_spmd_type: compute ops ──
+
+    def test_matmul_rr(self):
+        from verifier.state import LocalSPMDType
+        op = MatMul(a="a", b="b", output="y")
+        result = op.propagate_spmd_type({"a": LocalSPMDType.REPLICATE, "b": LocalSPMDType.REPLICATE})
+        assert result == LocalSPMDType.REPLICATE
+
+    def test_matmul_rv(self):
+        from verifier.state import LocalSPMDType
+        op = MatMul(a="a", b="b", output="y")
+        result = op.propagate_spmd_type({"a": LocalSPMDType.REPLICATE, "b": LocalSPMDType.VARYING})
+        assert result == LocalSPMDType.VARYING
+
+    def test_matmul_vr(self):
+        from verifier.state import LocalSPMDType
+        op = MatMul(a="a", b="b", output="y")
+        result = op.propagate_spmd_type({"a": LocalSPMDType.VARYING, "b": LocalSPMDType.REPLICATE})
+        assert result == LocalSPMDType.VARYING
+
+    def test_matmul_vv_defers(self):
+        from verifier.state import LocalSPMDType
+        op = MatMul(a="a", b="b", output="y")
+        result = op.propagate_spmd_type({"a": LocalSPMDType.VARYING, "b": LocalSPMDType.VARYING})
+        assert result is None
+
+    def test_matmul_p_absorbs(self):
+        from verifier.state import LocalSPMDType
+        op = MatMul(a="a", b="b", output="y")
+        result = op.propagate_spmd_type({"a": LocalSPMDType.PARTIAL, "b": LocalSPMDType.VARYING})
+        assert result == LocalSPMDType.PARTIAL
+
+    # ── propagate_spmd_type: element-wise ──
+
+    def test_add_rv(self):
+        from verifier.state import LocalSPMDType
+        op = Add(a="a", b="b", output="y")
+        result = op.propagate_spmd_type({"a": LocalSPMDType.REPLICATE, "b": LocalSPMDType.VARYING})
+        assert result == LocalSPMDType.VARYING
+
+    def test_add_pp(self):
+        from verifier.state import LocalSPMDType
+        op = Add(a="a", b="b", output="y")
+        result = op.propagate_spmd_type({"a": LocalSPMDType.PARTIAL, "b": LocalSPMDType.PARTIAL})
+        assert result == LocalSPMDType.PARTIAL
+
+    def test_add_pv(self):
+        from verifier.state import LocalSPMDType
+        op = Add(a="a", b="b", output="y")
+        result = op.propagate_spmd_type({"a": LocalSPMDType.PARTIAL, "b": LocalSPMDType.VARYING})
+        assert result == LocalSPMDType.PARTIAL
+
+    # ── propagate_spmd_type: unary ──
+
+    def test_silu_preserves(self):
+        from verifier.state import LocalSPMDType
+        op = SiLU(x="x", output="y")
+        result = op.propagate_spmd_type({"x": LocalSPMDType.VARYING})
+        assert result == LocalSPMDType.VARYING
+
+    # ── propagate_spmd_type: collectives ──
+
+    def test_allreduce_p_to_r(self):
+        from verifier.state import LocalSPMDType
+        op = AllReduce(x="x", output="y")
+        result = op.propagate_spmd_type({"x": LocalSPMDType.PARTIAL})
+        assert result == LocalSPMDType.REPLICATE
+
+    def test_allgather_v_to_r(self):
+        from verifier.state import LocalSPMDType
+        op = AllGather(x="x", output="y", gather_dim=0)
+        result = op.propagate_spmd_type({"x": LocalSPMDType.VARYING})
+        assert result == LocalSPMDType.REPLICATE
+
+    def test_reducescatter_to_v(self):
+        from verifier.state import LocalSPMDType
+        op = ReduceScatter(x="x", output="y", scatter_dim=0)
+        result = op.propagate_spmd_type({"x": LocalSPMDType.PARTIAL})
+        assert result == LocalSPMDType.VARYING
+
+    # ── SPMDGuard integration ──
+
+    def test_allreduce_rejects_replicate(self):
+        from verifier.ir.spmd import SPMDGuard
+        t = self._tensor("x", Replicate())
+        with pytest.raises(ValueError, match="SPMD violation"):
+            SPMDGuard.check_allreduce_input(t)
+
+    def test_allreduce_rejects_invariant(self):
+        from verifier.state import LocalSPMDType
+        from verifier.ir.spmd import SPMDGuard
+        t = self._tensor("x", Replicate())
+        t = t.with_local_type(LocalSPMDType.INVARIANT)
+        with pytest.raises(ValueError, match="INVARIANT"):
+            SPMDGuard.check_allreduce_input(t)
+
+    # ── apply_checked cross-validation ──
+
+    def test_apply_checked_consistent(self):
+        """apply_checked passes when SPMD type and placement agree."""
+        mesh = self._mesh()
+        x = self._tensor("x", Partial(), mesh)
+        op = AllReduce(x="x", output="y")
+        ctx = {"x": x}
+        result = op.apply_checked(ctx)
+        assert result.local_type.value == "R"
+
+    def test_apply_checked_matmul_rr(self):
+        mesh = self._mesh()
+        a = self._tensor("a", Replicate(), mesh)
+        b = TensorState(
+            name="b", global_shape=(16, 32),
+            local_shape=(16, 32),
+            sharding=ShardingSpec(placements=(Replicate(),), mesh=mesh),
+            expr="b",
+        )
+        op = MatMul(a="a", b="b", output="y")
+        ctx = {"a": a, "b": b}
+        result = op.apply_checked(ctx)
+        assert result.local_type.value == "R"
+
+    # ── executor with spmd_checking ──
+
+    def test_executor_spmd_checking_tp_linear(self):
+        """Executor with spmd_checking=True runs on a correct TP linear."""
+        mesh = self._mesh()
+        # Row parallel: S(1) @ S(0) → Partial → AllReduce → Replicate
+        x = TensorState(
+            name="x", global_shape=(8, 16), local_shape=(8, 8),
+            sharding=ShardingSpec(placements=(Shard(dim=1),), mesh=mesh),
+            expr="x",
+        )
+        w = TensorState(
+            name="w", global_shape=(16, 32), local_shape=(8, 32),
+            sharding=ShardingSpec(placements=(Shard(dim=0),), mesh=mesh),
+            expr="w",
+        )
+        prog = Program(ops=[
+            MatMul(a="x", b="w", output="h"),
+            AllReduce(x="h", output="y"),
+        ])
+
+        # Without SPMD checking (default)
+        executor = MultiDeviceExecutor(mesh=mesh)
+        executor.register_tensor(x)
+        executor.register_tensor(w)
+        result = executor.run_program(prog)
+        assert "y" in result
+
+        # With SPMD checking
+        executor2 = MultiDeviceExecutor(mesh=mesh, spmd_checking=True)
+        executor2.register_tensor(x)
+        executor2.register_tensor(w)
+        result2 = executor2.run_program(prog)
+        assert "y" in result2
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
