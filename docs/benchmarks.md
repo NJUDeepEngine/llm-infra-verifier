@@ -5,7 +5,7 @@ nav_order: 5
 
 # Benchmarks
 
-**49 cases across 5 suites, 100% detection rate.**
+**35 cases across 3 suites, 100% detection rate.**
 Derived from 16 real GitHub issues across PyTorch, Megatron-LM, TileLang, Triton, and DeepSeek TileKernels.
 
 ## Quick Run
@@ -13,8 +13,7 @@ Derived from 16 real GitHub issues across PyTorch, Megatron-LM, TileLang, Triton
 ```bash
 python benchmarks/benchmark_suite.py           # Suite 1: 16 synthetic cases
 python benchmarks/real_code_validation.py      # Suite 2: 8 real-code cases
-python benchmarks/real_bug_benchmark.py        # Suite 3: 16 real-bug cases
-python benchmarks/numerical_benchmark.py       # Suite 4: 9 numerical cases
+python benchmarks/real_bug_benchmark.py        # Suite 3: 11 real-bug cases
 ```
 
 ## Suite 1: Synthetic Bug Patterns (16 cases)
@@ -55,7 +54,7 @@ python benchmarks/real_code_validation.py
 | Megatron TP MLP | `megatron/.../megatron_mlp.py` |
 | Sequence Parallel + TP | `layers.py ~L200` |
 
-## Suite 3: Real-Bug Benchmark (16 cases)
+## Suite 3: Real-Bug Benchmark (11 cases)
 
 Each case shows the **original buggy code** from the GitHub issue, explains how we **translate it to our IR**, and reports the detection result. This is the most rigorous benchmark: it starts from actual code, not pre-encoded IR.
 
@@ -63,7 +62,7 @@ Each case shows the **original buggy code** from the GitHub issue, explains how 
 python benchmarks/real_bug_benchmark.py
 ```
 
-### PyTorch / Megatron-LM Issues (9 cases)
+### PyTorch / Megatron-LM Issues (7 cases)
 
 | ID | Bug | Source | Category |
 |----|-----|--------|----------|
@@ -72,50 +71,30 @@ python benchmarks/real_bug_benchmark.py
 | RB1c | Colwise missing AllGather | Megatron layers.py | Spatial |
 | RB2a | PP missing broadcast | Megatron#4092 | PP |
 | RB2b | Send/Recv direction mismatch | Megatron#1525 | PP |
-| RB3a | fp16 gradient underflow | PyTorch AMP docs | Numerical |
-| RB3b | Adam eps invisible in fp16 | PyTorch Adam docs | Numerical |
 | RB4a | Async AR without Wait | Megatron layers.py | Temporal |
 | RB4b | Gradient buffer reuse | Megatron layers.py | Temporal |
 
-### TileLang Issues (3 cases)
+### TileLang Issues (2 cases)
 
 | ID | Bug | Source | Category |
 |----|-----|--------|----------|
-| RB5a | Invalid fragment layout (non-injective) | tilelang#2158 | Resource |
+| RB5a | Invalid fragment layout (non-injective) | tilelang#2158 | Layout |
 | RB5b | Int8 matmul pipeline sync (num_stages) | tilelang#2172 | Temporal |
-| RB5c | fp8 cast mismatch vs torch | tilelang#2042 | Numerical |
 
-### Triton Issues (4 cases)
+### Triton Issues (2 cases)
 
 | ID | Bug | Source | Category |
 |----|-----|--------|----------|
-| RB6a | TF32 path instead of IEEE fp32 | triton#10176 | Numerical |
 | RB6b | Implicit int32→int8 truncation | triton#9991 | Type Safety |
 | RB6c | TMA NaN from mbarrier init race | triton#10106 | Temporal |
-| RB6d | Mixed int32/bf16 loop error | triton#9963 | Numerical |
-
-## Suite 4: Numerical Benchmarks (9 cases)
-
-IEEE 754 analytical error bounds and accumulation analysis.
-
-```bash
-python benchmarks/numerical_benchmark.py
-```
-
-| Category | Cases |
-|----------|-------|
-| N1: Same-Precision | Tree vs Ring, dtype effects, non-associativity |
-| N2: Cross-Precision | Cast magnitudes, fp16 boundaries, Adam eps visibility |
-| N3: Accumulation | 3-pathway comparison, multi-config, ZeRO effects |
 
 ## Detection Methods
 
 | Verifier Dimension | Cases Using It |
 |---|---|
 | Spatial (Z3 SMT) | RB1a-c, RB2a-b, B1-B6 (22 cases) |
-| Temporal (HB Graph) | RB4a-b, RB5b, RB6c, RB6d (7 cases) |
-| Numerical (IEEE 754) | RB3a-b, RB5c, RB6a-b (8 cases) |
-| Resource (Memory Graph) | RB5a (1 case) |
+| Temporal (HB Graph) | RB4a-b, RB5b, RB6c (5 cases) |
+| Structural (Type/Layout) | RB5a, RB6b (2 cases) |
 
 ## Issue Coverage
 

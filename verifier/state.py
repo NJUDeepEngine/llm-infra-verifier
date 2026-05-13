@@ -3,6 +3,10 @@
 TensorState tracks per-device tensor metadata: placement, sharding spec,
 symbolic expression, and autograd/pipeline annotations. The design follows
 DTensor semantics with explicit per-dimension sharding.
+
+DeviceTopology models the physical GPU hardware graph (nodes + links).
+DeviceMesh maps logical parallelism dimensions onto physical devices.
+TensorSlice tracks which slice of a global tensor each device holds.
 """
 
 from __future__ import annotations
@@ -11,6 +15,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Tuple, Dict, List
 import math
+from itertools import combinations
 
 
 # ── SPMD Local Type (R/I/V/P) — trust base from meta-pytorch/spmd_types ──────
@@ -91,23 +96,119 @@ class Partial:
 Placement = Shard | Replicate | Partial
 
 
+# ── Device topology (physical hardware graph) ───────────────────────────────
+
+@dataclass
+class DeviceNode:
+    """A single GPU device in the cluster."""
+    device_id: int
+
+    def __repr__(self):
+        return f"GPU({self.device_id})"
+
+
+@dataclass
+class Link:
+    """A communication link between two devices."""
+    src: int
+    dst: int
+    link_type: str = "NVLink"
+    bandwidth_gbps: float = 300.0
+
+    def __repr__(self):
+        return f"{self.src}↔{self.dst}({self.link_type})"
+
+
+@dataclass
+class DeviceTopology:
+    """Physical GPU topology: nodes (devices) and edges (links).
+
+    Models the hardware graph that computation is placed onto.
+    Each node is a GPU; each link represents direct connectivity
+    (NVLink, PCIe, or network).
+    """
+    nodes: List[DeviceNode] = field(default_factory=list)
+    links: List[Link] = field(default_factory=list)
+
+    def device_ids(self) -> List[int]:
+        return [n.device_id for n in self.nodes]
+
+    def neighbors(self, device_id: int) -> List[int]:
+        result = []
+        for link in self.links:
+            if link.src == device_id:
+                result.append(link.dst)
+            elif link.dst == device_id:
+                result.append(link.src)
+        return result
+
+    def are_connected(self, d1: int, d2: int) -> bool:
+        return any(
+            (link.src == d1 and link.dst == d2) or
+            (link.src == d2 and link.dst == d1)
+            for link in self.links
+        )
+
+    def all_connected(self, device_ids: List[int]) -> bool:
+        """Check if all given devices form a fully connected group."""
+        for d1, d2 in combinations(device_ids, 2):
+            if not self.are_connected(d1, d2):
+                return False
+        return True
+
+    def get_link(self, d1: int, d2: int) -> Optional[Link]:
+        for link in self.links:
+            if (link.src == d1 and link.dst == d2) or \
+               (link.src == d2 and link.dst == d1):
+                return link
+        return None
+
+    @staticmethod
+    def fully_connected(n_devices: int, link_type: str = "NVLink",
+                        bandwidth_gbps: float = 300.0) -> DeviceTopology:
+        """Create a fully connected topology (e.g., NVLink mesh within a node)."""
+        nodes = [DeviceNode(i) for i in range(n_devices)]
+        links = []
+        for i, j in combinations(range(n_devices), 2):
+            links.append(Link(i, j, link_type, bandwidth_gbps))
+        return DeviceTopology(nodes, links)
+
+    def __repr__(self):
+        return (f"DeviceTopology({len(self.nodes)} GPUs, "
+                f"{len(self.links)} links)")
+
+
 # ── Device mesh ──────────────────────────────────────────────────────────────
 
 @dataclass
 class DeviceMesh:
     """Multi-dimensional device topology.
 
+    Maps logical parallelism dimensions onto physical devices.
+    Optionally backed by a DeviceTopology that models hardware connectivity.
+
     Example:
-        mesh = DeviceMesh(shape=(2, 4), dim_names=("tp", "dp"))
+        topo = DeviceTopology.fully_connected(8)
+        mesh = DeviceMesh(shape=(2, 4), dim_names=("tp", "dp"),
+                          topology=topo)
         # 2 TP groups × 4 DP groups = 8 devices
     """
     shape: Tuple[int, ...]
     dim_names: Tuple[str, ...]
+    device_ids: Optional[List[int]] = None
+    topology: Optional[DeviceTopology] = None
 
     def __post_init__(self):
         if len(self.shape) != len(self.dim_names):
             raise ValueError(
                 f"shape {self.shape} and dim_names {self.dim_names} must have same length"
+            )
+        if self.device_ids is None:
+            self.device_ids = list(range(self.num_devices))
+        if len(self.device_ids) != self.num_devices:
+            raise ValueError(
+                f"device_ids length {len(self.device_ids)} != "
+                f"num_devices {self.num_devices}"
             )
 
     @property
@@ -122,6 +223,61 @@ class DeviceMesh:
         """Return (size, index) for a named mesh dimension."""
         idx = self.dim_names.index(dim_name)
         return self.shape[idx], idx
+
+    def coord_to_device(self, *coords: int) -> int:
+        """Map logical mesh coordinates to a physical device ID.
+
+        For mesh shape (2,4), coord (1,2) → flat index 1*4+2=6 → device_ids[6].
+        """
+        if len(coords) != self.ndim:
+            raise ValueError(f"Expected {self.ndim} coords, got {len(coords)}")
+        flat = 0
+        for i, c in enumerate(coords):
+            flat = flat * self.shape[i] + c
+        return self.device_ids[flat]
+
+    def device_to_coord(self, device_id: int) -> Tuple[int, ...]:
+        """Map a physical device ID back to logical mesh coordinates."""
+        flat = self.device_ids.index(device_id)
+        coords = []
+        for dim_size in reversed(self.shape):
+            coords.append(flat % dim_size)
+            flat //= dim_size
+        return tuple(reversed(coords))
+
+    def devices_in_group(self, mesh_dim: int, index: int) -> List[int]:
+        """All device IDs that share a communication group along mesh_dim.
+
+        E.g., for mesh (2,4), mesh_dim=0, index=0:
+          returns devices at coords (0,0),(0,1),(0,2),(0,3).
+        """
+        result = []
+        n = self.num_devices
+        for flat in range(n):
+            coords = []
+            tmp = flat
+            for dim_size in reversed(self.shape):
+                coords.append(tmp % dim_size)
+                tmp //= dim_size
+            coords = list(reversed(coords))
+            if coords[mesh_dim] == index:
+                result.append(self.device_ids[flat])
+        return result
+
+    def validate_topology(self) -> List[str]:
+        """Check that each communication group has full connectivity."""
+        if self.topology is None:
+            return []
+        errors = []
+        for dim in range(self.ndim):
+            for idx in range(self.shape[dim]):
+                group = self.devices_in_group(dim, idx)
+                if not self.topology.all_connected(group):
+                    errors.append(
+                        f"Communication group {self.dim_names[dim]}[{idx}] "
+                        f"devices {group} not fully connected"
+                    )
+        return errors
 
     def __repr__(self):
         return f"DeviceMesh(shape={self.shape}, dim_names={self.dim_names})"
@@ -195,7 +351,7 @@ class TensorState:
     expr: str = ""                         # symbolic expression, e.g. "(x @ w)"
 
     # ── SPMD type layer (new) ──
-    local_type: LocalSPMDType = field(default=None)  # auto-derived if None
+    local_type: Optional[LocalSPMDType] = field(default=None)  # auto-derived if None
 
     def __post_init__(self):
         """Auto-derive SPMD local_type from sharding if not explicitly set."""
@@ -351,3 +507,79 @@ def compute_local_shape(
             shape[p.dim] //= mesh_size
     # Partial and Replicate don't change local shape
     return tuple(shape)
+
+
+# ── Per-device tensor slice ─────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class TensorSlice:
+    """What slice of a global tensor a specific device holds.
+
+    For Shard(dim=0) on device 1 of TP=2, global_shape=(8, 16):
+      offsets=(4, 0), local_shape=(4, 16)
+      → this device holds rows [4:8], all columns [0:16]
+    """
+    device_id: int
+    global_shape: Tuple[int, ...]
+    local_shape: Tuple[int, ...]
+    offsets: Tuple[int, ...]
+
+    @property
+    def ranges(self) -> Tuple[Tuple[int, int], ...]:
+        """(start, end) per dimension."""
+        return tuple((o, o + s) for o, s in zip(self.offsets, self.local_shape))
+
+    def range_str(self) -> str:
+        """Human-readable slice notation, e.g. '[4:8, 0:16]'."""
+        parts = []
+        for dim, (start, end) in enumerate(self.ranges):
+            if start == 0 and end == self.global_shape[dim]:
+                parts.append(":")
+            else:
+                parts.append(f"{start}:{end}")
+        return "[" + ", ".join(parts) + "]"
+
+    def __repr__(self):
+        ranges = self.ranges
+        parts = [f"{s}:{e}" for s, e in ranges]
+        return f"Slice(dev{self.device_id}, [{', '.join(parts)}])"
+
+
+def compute_tensor_slices(
+    global_shape: Tuple[int, ...],
+    spec: ShardingSpec,
+) -> Dict[int, TensorSlice]:
+    """Compute the slice each device holds for a tensor.
+
+    Returns {device_id: TensorSlice} for all devices in the mesh.
+    For 1D mesh (TP): device d gets the d-th chunk along each sharded dim.
+    """
+    mesh = spec.mesh
+    n_devices = mesh.num_devices
+    local_shape = compute_local_shape(global_shape, spec)
+
+    result = {}
+    for flat_id in range(n_devices):
+        # Compute mesh coordinates for this device
+        coords = []
+        tmp = flat_id
+        for dim_size in reversed(mesh.shape):
+            coords.append(tmp % dim_size)
+            tmp //= dim_size
+        coords = list(reversed(coords))
+
+        # Compute offsets: for each sharded dim, offset = coord * chunk_size
+        offsets = [0] * len(global_shape)
+        for mesh_dim, p in enumerate(spec.placements):
+            if isinstance(p, Shard):
+                chunk = global_shape[p.dim] // mesh.shape[mesh_dim]
+                offsets[p.dim] = coords[mesh_dim] * chunk
+
+        device_id = mesh.device_ids[flat_id]
+        result[device_id] = TensorSlice(
+            device_id=device_id,
+            global_shape=global_shape,
+            local_shape=local_shape,
+            offsets=tuple(offsets),
+        )
+    return result

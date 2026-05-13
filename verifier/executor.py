@@ -22,6 +22,8 @@ from .state import (
     Replicate,
     Partial,
     compute_local_shape,
+    TensorSlice,
+    compute_tensor_slices,
 )
 from .ir import (
     IROp,
@@ -38,17 +40,29 @@ from .ir import (
     Reshape,
     Transpose,
     FlashAttention,
+    AllReduceAsync,
+    SendAsync,
+    RecvAsync,
+    Wait,
+    WaitAll,
+    OverlapRegion,
+    Reinterpret,
+    Convert,
 )
 
 
 @dataclass
 class DeviceState:
-    """State of a single device."""
+    """State of a single device, including per-tensor slice info."""
     device_id: int
     tensors: Dict[str, TensorState] = field(default_factory=dict)
+    slices: Dict[str, TensorSlice] = field(default_factory=dict)
 
     def get(self, name: str) -> Optional[TensorState]:
         return self.tensors.get(name)
+
+    def get_slice(self, name: str) -> Optional[TensorSlice]:
+        return self.slices.get(name)
 
     def set(self, tensor: TensorState, warn_on_overwrite: bool = True):
         if warn_on_overwrite:
@@ -66,6 +80,9 @@ class DeviceState:
                     f"placements={tensor.sharding.placements})"
                 )
         self.tensors[tensor.name] = tensor
+
+    def set_slice(self, name: str, s: TensorSlice):
+        self.slices[name] = s
 
     def has(self, name: str) -> bool:
         return name in self.tensors
@@ -112,12 +129,16 @@ class MultiDeviceExecutor:
                 )
                 break
 
+        all_slices = compute_tensor_slices(tensor.global_shape, tensor.sharding)
+
         for did in device_ids:
             local_t = copy.deepcopy(tensor)
             local_t.local_shape = compute_local_shape(
                 tensor.global_shape, tensor.sharding
             )
             self.devices[did].set(local_t, warn_on_overwrite=False)
+            if did in all_slices:
+                self.devices[did].set_slice(tensor.name, all_slices[did])
 
     def get_tensor(self, name: str, device_id: int = 0) -> Optional[TensorState]:
         """Get a tensor from a specific device."""
@@ -188,19 +209,29 @@ class MultiDeviceExecutor:
             self._exec_unary(op)
         elif isinstance(op, FlashAttention):
             self._exec_flash_attn(op)
+        elif isinstance(op, AllReduceAsync):
+            self._exec_collective_unary(op)
+        elif isinstance(op, (Wait, WaitAll)):
+            self._exec_sync(op)
+        elif isinstance(op, SendAsync):
+            self._exec_send_async(op)
+        elif isinstance(op, RecvAsync):
+            self._exec_recv_async(op)
+        elif isinstance(op, OverlapRegion):
+            self._exec_overlap(op)
+        elif isinstance(op, (Reinterpret, Convert)):
+            self._exec_unary(op)
         else:
             raise ValueError(
                 f"Unknown op type: {type(op).__name__} (repr: {op}). "
-                f"inputs={op.input_names}, output={op.output_name}. "
-                f"Supported types: MatMul, Add, Multiply, SiLU, AllReduce, AllGather, "
-                f"ReduceScatter, Send, Recv, Reshape, Transpose, FlashAttention"
+                f"inputs={op.input_names}, output={op.output_name}."
             )
 
         # Save intermediate state snapshot
         self._save_state()
 
     def _exec_matmul(self, op: MatMul):
-        """Execute MatMul on all devices."""
+        """Execute MatMul on all devices, propagating slices."""
         for did, dev in self.devices.items():
             a = dev.get(op.a)
             b = dev.get(op.b)
@@ -216,10 +247,22 @@ class MultiDeviceExecutor:
                         f"Skipping op. Available: {list(dev.tensors.keys())}"
                     )
                 continue
-            # Use the op's apply method with device-local context
             local_ctx = {op.a: a, op.b: b}
             result = op.apply(local_ctx)
             dev.set(result)
+
+            # Propagate slices: Y = A @ B → Y rows from A, Y cols from B
+            sa = dev.get_slice(op.a)
+            sb = dev.get_slice(op.b)
+            if sa is not None and sb is not None:
+                out_global = result.global_shape
+                out_offsets = (sa.offsets[0], sb.offsets[1] if len(sb.offsets) > 1 else 0)
+                dev.set_slice(op.output, TensorSlice(
+                    device_id=did,
+                    global_shape=out_global,
+                    local_shape=result.local_shape,
+                    offsets=out_offsets,
+                ))
 
     def _exec_elementwise(self, op: Add | Multiply):
         """Execute element-wise op on all devices."""
@@ -241,6 +284,17 @@ class MultiDeviceExecutor:
             local_ctx = {op.a: a, op.b: b}
             result = op.apply(local_ctx)
             dev.set(result)
+            # Element-wise: inherit slice from whichever input is sharded
+            sa = dev.get_slice(op.a)
+            sb = dev.get_slice(op.b)
+            src = sa or sb
+            if src is not None:
+                dev.set_slice(op.output, TensorSlice(
+                    device_id=did,
+                    global_shape=result.global_shape,
+                    local_shape=result.local_shape,
+                    offsets=src.offsets,
+                ))
 
     def _exec_unary(self, op: SiLU | Reshape | Transpose):
         """Execute unary op on all devices."""
@@ -255,6 +309,15 @@ class MultiDeviceExecutor:
             local_ctx = {op.input_names[0]: x}
             result = op.apply(local_ctx)
             dev.set(result)
+            # Unary: inherit slice from input
+            sx = dev.get_slice(op.input_names[0])
+            if sx is not None:
+                dev.set_slice(op.output_name, TensorSlice(
+                    device_id=did,
+                    global_shape=result.global_shape,
+                    local_shape=result.local_shape,
+                    offsets=sx.offsets,
+                ))
 
     def _exec_allreduce(self, op: AllReduce):
         """AllReduce: each device reduces its partial → replicated."""
@@ -265,6 +328,13 @@ class MultiDeviceExecutor:
             local_ctx = {op.x: x}
             result = op.apply(local_ctx)
             dev.set(result)
+            # After AllReduce, every device holds the full tensor
+            dev.set_slice(op.output, TensorSlice(
+                device_id=did,
+                global_shape=result.global_shape,
+                local_shape=result.local_shape,
+                offsets=tuple(0 for _ in result.global_shape),
+            ))
 
     def _exec_allgather(self, op: AllGather):
         """AllGather: gather sharded dims across devices."""
@@ -334,10 +404,7 @@ class MultiDeviceExecutor:
         dst_dev.set(received)
 
     def _exec_flash_attn(self, op: FlashAttention):
-        """Execute FlashAttention on all devices (CP semantics).
-
-        Each device has Q replicated but K, V sharded on seq_len.
-        """
+        """Execute FlashAttention on all devices (CP semantics)."""
         for did, dev in self.devices.items():
             q = dev.get(op.q)
             k = dev.get(op.k)
@@ -347,6 +414,66 @@ class MultiDeviceExecutor:
             local_ctx = {op.q: q, op.k: k, op.v: v}
             result = op.apply(local_ctx)
             dev.set(result)
+            # Output inherits Q's slice
+            sq = dev.get_slice(op.q)
+            if sq is not None:
+                dev.set_slice(op.output, TensorSlice(
+                    device_id=did,
+                    global_shape=result.global_shape,
+                    local_shape=result.local_shape,
+                    offsets=sq.offsets,
+                ))
+
+    def _exec_collective_unary(self, op):
+        """Execute a collective unary op (e.g. AllReduceAsync) on all devices."""
+        for did, dev in self.devices.items():
+            x = dev.get(op.x)
+            if x is None:
+                continue
+            local_ctx = {op.x: x}
+            result = op.apply(local_ctx)
+            dev.set(result)
+
+    def _exec_sync(self, op):
+        """Execute Wait/WaitAll on all devices."""
+        for did, dev in self.devices.items():
+            local_ctx = dict(dev.tensors)
+            result = op.apply(local_ctx)
+            if result is not None:
+                dev.set(result)
+            if isinstance(op, WaitAll):
+                for out_name in op.outputs:
+                    t = local_ctx.get(out_name)
+                    if t is not None:
+                        dev.set(t)
+
+    def _exec_send_async(self, op: SendAsync):
+        """Execute async Send."""
+        src_dev = self.devices.get(op.src)
+        dst_dev = self.devices.get(op.dst)
+        if src_dev is None or dst_dev is None:
+            return
+        x = src_dev.get(op.x)
+        if x is None:
+            return
+        local_ctx = {op.x: x}
+        result = op.apply(local_ctx)
+        dst_dev.set(result)
+
+    def _exec_recv_async(self, op: RecvAsync):
+        """Execute async Recv."""
+        dst_dev = self.devices.get(op.dst)
+        if dst_dev is None:
+            return
+        x = dst_dev.get(op.x)
+        local_ctx = {op.x: x} if x else {}
+        result = op.apply(local_ctx)
+        dst_dev.set(result)
+
+    def _exec_overlap(self, op: OverlapRegion):
+        """Execute an overlap region: run compute and comm ops."""
+        for sub in op.compute_ops + op.comm_ops:
+            self._execute_op(sub)
 
     def _save_state(self):
         """Save a snapshot of all device states."""
@@ -372,6 +499,13 @@ class MultiDeviceExecutor:
         result = {}
         for did, dev in self.devices.items():
             result[did] = dict(dev.tensors)
+        return result
+
+    def final_slices(self) -> Dict[int, Dict[str, TensorSlice]]:
+        """Return the final per-device slices for all tensors."""
+        result = {}
+        for did, dev in self.devices.items():
+            result[did] = dict(dev.slices)
         return result
 
     def __repr__(self):

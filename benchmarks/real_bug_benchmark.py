@@ -16,7 +16,6 @@ ALREADY encodes the bug, this benchmark:
 Categories:
   RB1 — Tensor Parallelism bugs
   RB2 — Pipeline Parallelism bugs
-  RB3 — Numerical / precision bugs
   RB4 — Async / overlap bugs
 """
 
@@ -235,65 +234,6 @@ recv(h0, src=0)   # BUG: should be src=0, but typo'd as src=2!
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# RB3: Numerical / Precision Bugs
-# ═══════════════════════════════════════════════════════════════════════════════
-
-RB3A_FP16_GRADIENT_UNDERFLOW = RealBugCase(
-    id="RB3a",
-    title="fp16 gradient underflow: loss scale too small",
-    source_url="https://pytorch.org/docs/stable/amp.html#gradient-scaling",
-    category="Numerical",
-    original_code="""\
-# Mixed precision training with fp16:
-# If loss_scale is too small, gradients < fp16 min_normal (6.1e-5)
-# become ZERO → optimizer sees zero gradient → weights stop updating.
-
-# Typical scenario:
-loss_scale = 128
-grad = compute_gradient()  # typical magnitude ~1e-5
-scaled_grad = grad * loss_scale  # 1e-5 * 128 = 1.28e-3 → OK
-# But if grad ~ 1e-7:
-scaled_grad = 1e-7 * 128 = 1.28e-5  # < fp16 min_normal → ZERO!""",
-    translation_notes=(
-        "Our numerical verifier detects fp16 boundary conditions. "
-        "Given a gradient magnitude estimate, it computes the minimum "
-        "loss_scale needed to keep gradients above fp16 min_normal. "
-        "This is a STRUCTURAL check: doesn't need actual gradient values, "
-        "just magnitude estimates based on model size and batch size."
-    ),
-    setup_fn=lambda: (None, None, None),  # numerical verifier works standalone
-    verify_fn=lambda p, t, m: _verify_fp16_gradient_safety(),
-)
-
-RB3B_ADAM_EPSILON_FP16 = RealBugCase(
-    id="RB3b",
-    title="Adam epsilon has no effect in fp16 (1e-8 < 6e-5 min_normal)",
-    source_url="https://pytorch.org/docs/stable/generated/torch.optim.Adam.html",
-    category="Numerical",
-    original_code="""\
-# Standard Adam:
-#   theta = theta - lr * m_hat / (sqrt(v_hat) + 1e-8)
-
-# In fp16: min_normal = 6.1e-5
-# If v_hat is computed in fp16:
-#   sqrt(v_hat) is at least sqrt(6.1e-5) ≈ 7.8e-3
-#   So sqrt(v_hat) + 1e-8 = sqrt(v_hat)  ← epsilon has ZERO effect
-
-# The numerical stability guarantee that epsilon provides in fp32
-# is ABSENT in fp16. The optimizer behaves differently.""",
-    translation_notes=(
-        "Our numerical verifier's OverflowRiskDetector checks this: "
-        "Adam eps (1e-8) vs fp16 min_normal (6.1e-5) → ratio 6104x. "
-        "The verifier warns that fp16 Adam state is unsafe and "
-        "recommends fp32 for m/v. "
-        "This is a pure property check — no training data needed."
-    ),
-    setup_fn=lambda: (None, None, None),
-    verify_fn=lambda p, t, m: _verify_adam_eps_fp16(),
-)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # RB4: Async / Overlap Bugs
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -480,24 +420,6 @@ def _verify_temporal(prog, tensors, mesh):
         reports.append(VerifyResult(False, r.race_type.value, r.description))
     return reports or [VerifyResult(True, "temporal", "no violations")]
 
-def _verify_fp16_gradient_safety():
-    from verifier.numerical import Dtype, DTYPE_PROPS
-    fp16_min = DTYPE_PROPS[Dtype.FP16].min_normal
-    grad_mag_estimate = 1e-5
-    min_scale = fp16_min / grad_mag_estimate
-    if min_scale > 1:
-        return [VerifyResult(False, "fp16 underflow",
-            f"Need loss_scale >= {min_scale:.0f} to keep grad > fp16 min_normal")]
-    return [VerifyResult(True, "fp16 underflow", "gradient safe")]
-
-def _verify_adam_eps_fp16():
-    from verifier.numerical import Dtype, DTYPE_PROPS
-    fp16_min = DTYPE_PROPS[Dtype.FP16].min_normal
-    adam_eps = 1e-8
-    if adam_eps < fp16_min:
-        return [VerifyResult(False, "Adam fp16",
-            f"Adam eps={adam_eps} < fp16 min={fp16_min:.1e} → NO EFFECT")]
-    return [VerifyResult(True, "Adam fp16", "eps visible")]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -662,66 +584,10 @@ def int8_matmul(A, B, C):
     verify_fn=lambda p, t, m: _verify_temporal(p, t, m),
 )
 
-RB5C_TILELANG_FP8_CAST = RealBugCase(
-    id="RB5c",
-    title="TileLang #2042: fp8e8m0 cast produces different results from torch",
-    source_url="https://github.com/tile-ai/tilelang/issues/2042",
-    category="TileLang: Numeric Precision",
-    original_code="""\
-# TileLang #2042: Casting to fp8e8m0 gives results DIFFERENT from torch.
-# fp8e8m0: 8 bits total = 1 sign + 5 exponent + 2 mantissa
-# Machine epsilon: 2^(-2) = 0.25 → 25% relative error per cast!
-# torch uses different rounding mode or saturation behavior.
-
-@tilelang.jit
-def cast_kernel(A, B):
-    A_fp8 = T.cast(A, "fp8e8m0")
-    B_fp8 = T.cast(B, "fp8e8m0")
-    # BUG: results differ from torch due to rounding differences""",
-    translation_notes=(
-        "Our NUMERICAL verifier's DtypeModel includes fp8_e5m2 (ε=0.25). "
-        "The cast error from fp32→fp8_e5m2 is 0.5*2^(-2)=0.125 relative. "
-        "This is ENORMOUS compared to fp16 (4.88e-4) — 256x worse. "
-        "Detection: flag as HIGH-RISK cast with ε > 1e-2. "
-        "The verifier correctly warns that fp8 has insufficient precision "
-        "for most training purposes without specialized scaling."
-    ),
-    setup_fn=lambda: (None, None, None),
-    verify_fn=lambda p, t, m: _verify_fp8_cast_risk(),
-)
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # RB6: Triton Issues
 # ═══════════════════════════════════════════════════════════════════════════════
-
-RB6A_TRITON_TF32_IEEE = RealBugCase(
-    id="RB6a",
-    title="Triton #10176: bf16→fp32 upcast silently uses TF32 instead of IEEE",
-    source_url="https://github.com/triton-lang/triton/issues/10176",
-    category="Triton: Numeric Precision",
-    original_code="""\
-# Triton #10176: When upcasting bf16 to fp32 inside kernel,
-# Triton uses TF32 path despite user passing input_precision="ieee".
-# TF32: 19-bit mantissa (truncated fp32), not full 23-bit IEEE.
-# This silently reduces precision without warning.
-
-@triton.jit
-def kernel(x_bf16, y_fp32):
-    # User expects IEEE fp32 precision
-    x_fp32 = x_bf16.to(tl.float32)  # BUG: uses TF32 path!
-    y_fp32 = x_fp32 * 2.0  # computed with reduced precision""",
-    translation_notes=(
-        "Our NUMERICAL verifier models TF32 as having ε=2^(-10)=9.77e-4 "
-        "(same as fp16 mantissa width), vs IEEE fp32 ε=1.19e-7. "
-        "The verifier detects that the effective precision is 8192x worse "
-        "than expected. We model this as: compute_dtype claims fp32 but "
-        "actual ε matches fp16/bf16 → flag as precision mismatch. "
-        "This catches the silent precision degradation."
-    ),
-    setup_fn=lambda: (None, None, None),
-    verify_fn=lambda p, t, m: _verify_tf32_precision_mismatch(),
-)
 
 RB6B_TRITON_IMPLICIT_CAST = RealBugCase(
     id="RB6b",
@@ -740,13 +606,10 @@ def kernel(ptr_i8, value_i32):
     # Only lower 8 bits survive, upper 24 bits lost.
     # No warning, no error — silent data corruption.""",
     translation_notes=(
-        "Our NUMERICAL verifier models type casts with error bounds. "
-        "int32→int8 truncation: loses 24 bits → 2^(-8) relative error "
-        "for values < 128, and COMPLETE LOSS for values >= 256. "
-        "Detection: flag any cast where dst bits < src bits and no explicit "
-        "truncation op → POTENTIAL DATA LOSS. "
-        "This is a type-safety check: the verifier warns that the implicit "
-        "cast has {src_bits - dst_bits} bits of information loss."
+        "Type-safety check: int32→int8 truncation loses 24 bits → "
+        "2^(-8) relative error for values < 128, COMPLETE LOSS for "
+        "values >= 256. Detection: flag any cast where dst bits < src "
+        "bits and no explicit truncation op → POTENTIAL DATA LOSS."
     ),
     setup_fn=lambda: (None, None, None),
     verify_fn=lambda p, t, m: _verify_implicit_cast_truncation(),
@@ -788,38 +651,6 @@ x = tl.load(iq_smem)         # reads NaN if TMA not complete""",
     setup_fn=lambda: _setup_tma_barrier_race(),
     verify_fn=lambda p, t, m: _verify_temporal(p, t, m),
 )
-
-RB6D_TRITON_MIXED_TYPE_ARITHMETIC = RealBugCase(
-    id="RB6d",
-    title="Triton #9963: Wrong results from while-loop with mixed int32/bf16 arithmetic",
-    source_url="https://github.com/triton-lang/triton/issues/9963",
-    category="Triton: Type Safety",
-    original_code="""\
-# Triton #9963: While-loop with mixed int32 and bf16 arithmetic
-# produces wrong results. The type promotion rules in loops
-# cause unexpected truncation or precision loss.
-
-@triton.jit
-def kernel(a_bf16, b_i32):
-    acc = tl.zeros((1,), tl.float32)
-    while b_i32 > 0:
-        # BUG: mixing bf16 (7-bit mantissa) with int32 in loop
-        # causes bf16 to be promoted/demoted incorrectly
-        acc += a_bf16 * b_i32.to(tl.float32)
-        b_i32 -= 1""",
-    translation_notes=(
-        "Our NUMERICAL verifier detects type mixing in loops as an "
-        "ACCUMULATION risk: bf16 has ε=7.81e-3 (0.8%), and repeated "
-        "accumulation in a loop amplifies the error. "
-        "Detection: for loop-carried accumulators with mixed precision, "
-        "the per-iteration error ε_sum grows as O(ε·N_iterations) for "
-        "sequential accumulation. The verifier flags this as a precision "
-        "risk, recommending fp32 for the accumulator."
-    ),
-    setup_fn=lambda: (None, None, None),
-    verify_fn=lambda p, t, m: _verify_mixed_type_loop_accumulation(),
-)
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Additional setup & verify functions for TileLang/Triton cases
@@ -867,11 +698,11 @@ def _setup_tma_barrier_race():
 
 def _verify_resource_mismatch(prog, tensors, mesh):
     """Check: logical elements vs execution units. TileLang #2158."""
+    import math
     from verifier.solver import VerifyResult
     results = []
     for name, ts in tensors.items():
         logical_elems = math.prod(ts.global_shape)
-        # Bug scenario: 256 elements / 2 threads = 128/thread → non-injective
         for threads in [2, 64, 128, 256]:
             if logical_elems / threads > 64:
                 results.append(VerifyResult(False, "resource mismatch",
@@ -880,28 +711,6 @@ def _verify_resource_mismatch(prog, tensors, mesh):
                     f"threads. Likely non-injective. (TileLang #2158)"))
                 break
     return results or [VerifyResult(True, "resource", "layout OK")]
-
-def _verify_fp8_cast_risk():
-    from verifier.numerical import Dtype, ErrorModel
-    from verifier.solver import VerifyResult
-    model = ErrorModel(Dtype.FP32, Dtype.FP32)
-    err = model.cast_error(Dtype.FP32, Dtype.FP8_E5M2)
-    results = []
-    if err.relative > 0.01:
-        results.append(VerifyResult(False, "fp8 cast risk",
-            f"fp32→fp8 cast error {err.relative:.2e} > 1% threshold. "
-            f"fp8 has only {2} mantissa bits (ε=0.25)."))
-    return results or [VerifyResult(True, "fp8 cast", "acceptable")]
-
-def _verify_tf32_precision_mismatch():
-    from verifier.numerical import Dtype, DTYPE_PROPS
-    from verifier.solver import VerifyResult
-    fp32_eps = DTYPE_PROPS[Dtype.FP32].machine_epsilon  # 1.19e-7
-    tf32_eps = DTYPE_PROPS[Dtype.FP16].machine_epsilon  # 9.77e-4 (same mantissa)
-    ratio = tf32_eps / fp32_eps
-    return [VerifyResult(False, "TF32 precision",
-        f"TF32 path uses ε={tf32_eps:.2e} vs IEEE fp32 ε={fp32_eps:.2e}. "
-        f"Precision is {ratio:.0f}x worse than expected.")]
 
 def _verify_implicit_cast_truncation():
     from verifier.solver import VerifyResult
@@ -912,37 +721,20 @@ def _verify_implicit_cast_truncation():
         f"Values >= 2^{dst_bits}={2**dst_bits} are corrupted. "
         f"Maximum relative error for values < 2^{dst_bits}: 2^(-{dst_bits})={2**(-dst_bits):.1e}.")]
 
-def _verify_mixed_type_loop_accumulation():
-    from verifier.numerical import Dtype, DTYPE_PROPS
-    from verifier.solver import VerifyResult
-    bf16_eps = DTYPE_PROPS[Dtype.BF16].machine_epsilon  # 7.81e-3
-    n_iter = 1000
-    accum_err = n_iter * 0.5 * bf16_eps  # sequential accumulation
-    return [VerifyResult(False, "loop accumulation",
-        f"bf16 accumulation over {n_iter} iterations: "
-        f"error bound ≈ {accum_err:.2e} ({accum_err*100:.1f}%). "
-        f"Recommend fp32 accumulator.")]
-
-
 ALL_REAL_BUGS = [
     RB1A_ROW_PARALLEL_MISSING_AR,
     RB1B_GELU_COLWISE_ROWWISE,
     RB1C_COLUMN_PARALLEL_GATHER_OUTPUT,
     RB2A_MISSING_PP_BROADCAST,
     RB2B_MISMATCHED_SEND_RECV,
-    RB3A_FP16_GRADIENT_UNDERFLOW,
-    RB3B_ADAM_EPSILON_FP16,
     RB4A_ASYNC_AR_WITHOUT_WAIT,
     RB4B_GRADIENT_BUFFER_REUSE,
     # TileLang issues
     RB5A_TILELANG_INVALID_LAYOUT,
     RB5B_TILELANG_PIPELINE_SYNC,
-    RB5C_TILELANG_FP8_CAST,
     # Triton issues
-    RB6A_TRITON_TF32_IEEE,
     RB6B_TRITON_IMPLICIT_CAST,
     RB6C_TRITON_TMA_NAN,
-    RB6D_TRITON_MIXED_TYPE_ARITHMETIC,
 ]
 
 

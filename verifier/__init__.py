@@ -4,10 +4,16 @@ from .state import (
     Replicate,
     Partial,
     Placement,
+    DeviceNode,
+    Link,
+    DeviceTopology,
     DeviceMesh,
     ShardingSpec,
     TensorState,
+    TensorSlice,
     AccessPattern,
+    compute_local_shape,
+    compute_tensor_slices,
 )
 from .ir import (
     IROp,
@@ -56,6 +62,7 @@ from .schedules import (
 )
 from .solver import (
     DistributedVerifier,
+    Z3PlacementSolver,
     VerifyResult,
     verify_postcondition,
     verify_gradient_duality,

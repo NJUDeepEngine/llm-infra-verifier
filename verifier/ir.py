@@ -405,7 +405,7 @@ class Multiply(IROp):
             global_shape=b.global_shape,
             local_shape=b.local_shape,
             sharding=b.sharding,
-            expr=f"grad({a.expr}) * {a.expr}" if a.expr and b.expr else "",
+            expr=f"grad({self.output}) * {a.expr}" if a.expr and b.expr else "",
         )
         return {self.a: grad_a, self.b: grad_b}
 
@@ -530,14 +530,14 @@ class AllReduce(IROp):
             placements=tuple(new_placements),
             mesh=x.sharding.mesh,
         )
-        out_local = x.global_shape  # Replicated → local == global
+        out_local = compute_local_shape(x.global_shape, out_spec)
 
         result = TensorState(
             name=self.output,
             global_shape=x.global_shape,
             local_shape=out_local,
             sharding=out_spec,
-            expr=x.expr,  # AllReduce preserves the expression
+            expr=x.expr,
             requires_grad=x.requires_grad,
             grad_name=f"grad_{self.output}",
         )
@@ -612,9 +612,8 @@ class AllGather(IROp):
             mesh=x.sharding.mesh,
         )
 
-        # Full shape after gather
         out_global = x.global_shape
-        out_local = out_global  # replicated → local is full
+        out_local = compute_local_shape(out_global, out_spec)
 
         result = TensorState(
             name=self.output,
@@ -684,11 +683,12 @@ class ReduceScatter(IROp):
     def apply(self, ctx: Dict[str, TensorState]) -> TensorState:
         x = ctx[self.x]
 
-        # Replace Replicate with Shard(scatter_dim)
+        # ReduceScatter: Partial → Shard (reduce eliminates partial, scatter shards)
+        # Also accept Replicate → Shard for convenience
         new_placements = []
         found = False
         for p in x.sharding.placements:
-            if isinstance(p, Replicate) and not found:
+            if (isinstance(p, (Replicate, Partial))) and not found:
                 new_placements.append(Shard(dim=self.scatter_dim))
                 found = True
             else:
@@ -719,17 +719,18 @@ class ReduceScatter(IROp):
     ) -> Dict[str, TensorState]:
         # VJP of ReduceScatter is AllGather
         x = ctx[self.x]
+        out_placements = []
+        for p in x.sharding.placements:
+            if isinstance(p, (Replicate, Partial)):
+                out_placements.append(Replicate())
+            else:
+                out_placements.append(p)
+        grad_spec = ShardingSpec(placements=tuple(out_placements), mesh=x.sharding.mesh)
         grad_x = TensorState(
             name=f"grad_{self.x}",
             global_shape=x.global_shape,
-            local_shape=x.global_shape,
-            sharding=ShardingSpec(
-                placements=tuple(
-                    Replicate() if isinstance(p, Replicate) else p
-                    for p in x.sharding.placements
-                ),
-                mesh=x.sharding.mesh,
-            ),
+            local_shape=compute_local_shape(x.global_shape, grad_spec),
+            sharding=grad_spec,
             expr=f"AllGather(grad({x.expr}), dim={self.scatter_dim})" if x.expr else "",
         )
         return {self.x: grad_x}
@@ -940,7 +941,7 @@ class Reshape(IROp):
         result = TensorState(
             name=self.output,
             global_shape=self.new_shape,
-            local_shape=self.new_shape,  # simplification
+            local_shape=compute_local_shape(self.new_shape, x.sharding),
             sharding=x.sharding,
             expr=f"reshape({x.expr})" if x.expr else "",
             requires_grad=x.requires_grad,

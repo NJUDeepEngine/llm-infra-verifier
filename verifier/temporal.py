@@ -199,10 +199,6 @@ class TemporalGraph:
         if op.output_name:
             writes.add(op.output_name)
 
-        # In-place ops also read what they write
-        if isinstance(op, (Multiply, Add, SiLU)):
-            reads.add(op.output_name)  # in-place may read existing buffer
-
         # OverlapRegion: reads and writes of all sub-ops
         if isinstance(op, OverlapRegion):
             for sub in op.compute_ops + op.comm_ops:

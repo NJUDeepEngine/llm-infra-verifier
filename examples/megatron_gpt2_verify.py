@@ -6,26 +6,20 @@ Models the actual Megatron GPT-2 transformer layer with Tensor Parallelism:
   - Attention + Output Proj: RowParallelLinear (fwd AllReduce)
   - MLP Gate+Up: ColumnParallelLinear (no fwd comm)
   - MLP Down: RowParallelLinear (fwd AllReduce)
-  - Mixed precision: fp16 forward + fp32 AllReduce + fp32 Adam
 
 Verification dimensions:
   Spatial: placement correctness, gradient duality
   Temporal: async AllReduce overlap safety
-  Numerical: fp16 precision safety, accumulation bounds
-  Resource: HBM memory budget for GPT-2 model sizes
 
-Runs 8 verification scenarios:
-  V1: Correct GPT-2 layer (spatial + temporal + numerical)
+Runs 5 verification scenarios:
+  V1: Correct GPT-2 layer (spatial)
   V2: Missing AllReduce after output projection → DETECTED
   V3: Missing AllReduce after MLP down → DETECTED
   V4: GELU bug: SiLU on sharded tensor → DETECTED
   V5: Async gradient race → DETECTED
-  V6: Full GPT-2 model memory planning (H100/H200/B200)
-  V7: fp16 numerical safety for GPT-2 training
-  V8: Multi-layer accumulation over 100k steps
 """
 
-import sys, os, math
+import sys, os
 from typing import Tuple
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -41,22 +35,11 @@ from verifier.executor import MultiDeviceExecutor
 from verifier.solver import DistributedVerifier, VerifyResult
 from verifier.rewrite import PlacementAnalyzer
 from verifier.temporal import verify_temporal
-from verifier.numerical import (
-    Dtype, ErrorModel, ReductionErrorAnalyzer, ErrorAccumulator,
-    OverflowRiskDetector, ZeROStage, verify_numerical,
-)
-from verifier.hardware import GPU_MODELS, H100_SXM, H200_SXM, B200
-from verifier.memory_graph import estimate_llm_memory
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GPT-2 Model Configuration (Megatron defaults)
 # ═══════════════════════════════════════════════════════════════════════════════
-
-GPT2_SMALL = dict(hidden_dim=768, num_layers=12, num_heads=12, vocab_size=50257)
-GPT2_MEDIUM = dict(hidden_dim=1024, num_layers=24, num_heads=16, vocab_size=50257)
-GPT2_LARGE = dict(hidden_dim=1280, num_layers=36, num_heads=20, vocab_size=50257)
-GPT2_XL = dict(hidden_dim=1600, num_layers=48, num_heads=25, vocab_size=50257)
 
 
 def build_gpt2_transformer_layer(
@@ -177,13 +160,6 @@ def v1_correct_gpt2_layer():
     print(f"\n  Spatial checks:")
     for name, ok in checks:
         print(f"    [{('PASS' if ok else 'FAIL')}] {name}")
-
-    # Numerical: fp16 safety
-    detector = OverflowRiskDetector(Dtype.FP16)
-    risks = detector.check_activations(hidden_dim=768, num_layers=12)
-    print(f"\n  Numerical (fp16 safety):")
-    for r in risks:
-        print(f"    {r.risk_level}: {r.name}")
 
     all_ok = all(ok for _, ok in checks)
     print(f"\n  Verdict: {'ALL PASSED' if all_ok else 'ISSUES FOUND'}")
@@ -328,153 +304,11 @@ def v5_async_gradient_race():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# V6: GPT-2 memory planning across GPU generations
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def v6_gpt2_memory_planning():
-    """Check GPT-2 memory requirements on H100/H200/B200."""
-    print("\n" + "=" * 70)
-    print("  V6: Resource — GPT-2 Memory Planning Across GPUs")
-    print("=" * 70)
-
-    configs = [
-        ("GPT-2 Small (124M)", GPT2_SMALL),
-        ("GPT-2 Medium (355M)", GPT2_MEDIUM),
-        ("GPT-2 Large (774M)", GPT2_LARGE),
-        ("GPT-2 XL (1.5B)", GPT2_XL),
-    ]
-
-    gpus = [H100_SXM, H200_SXM, B200]
-
-    print(f"  {'Model':<25} ", end="")
-    for g in gpus:
-        print(f"  {g.name.split()[1]:>8}", end="")
-    print()
-
-    for name, cfg in configs:
-        print(f"  {name:<25} ", end="")
-        for gpu in gpus:
-            mem = estimate_llm_memory(
-                cfg["hidden_dim"], cfg["num_layers"],
-                cfg["vocab_size"], batch_size=8, seq_len=1024, tp_size=1,
-            )
-            total_gb = mem["total"] / (1024**3)
-            fits = "✓" if total_gb < gpu.total_hbm_gb else "OOM"
-            print(f"  {fits} {total_gb:>5.0f}G", end="")
-        print()
-
-    print(f"\n  With TP=2 (activations halved):")
-    for name, cfg in configs:
-        print(f"  {name:<25} ", end="")
-        for gpu in gpus:
-            mem = estimate_llm_memory(
-                cfg["hidden_dim"], cfg["num_layers"],
-                cfg["vocab_size"], batch_size=8, seq_len=1024, tp_size=2,
-            )
-            total_gb = mem["total"] / (1024**3)
-            fits = "✓" if total_gb < gpu.total_hbm_gb else "OOM"
-            print(f"  {fits} {total_gb:>5.0f}G", end="")
-        print()
-
-    return True
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# V7: Numerical safety for GPT-2 fp16 training
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def v7_numerical_safety():
-    """fp16 numerical safety analysis for GPT-2 training."""
-    print("\n" + "=" * 70)
-    print("  V7: Numerical — fp16 Safety for GPT-2 Training")
-    print("=" * 70)
-
-    # GPT-2 Small with 2-way TP, fp16 compute, fp32 AR + Adam
-    result = verify_numerical(
-        n_ranks=2,
-        topology="tree",
-        compute_dtype=Dtype.FP16,
-        accumulate_dtype=Dtype.FP32,
-        optimizer="adam",
-        zero_stage=ZeROStage.DP,
-        hidden_dim=768,
-        num_layers=12,
-        batch_size=8,
-    )
-
-    print(f"\n  Reduction analysis:")
-    print(f"    Tree AR(N=2): {result.reduction_analysis.tree_error}")
-    print(f"    Ring AR(N=2): {result.reduction_analysis.ring_error}")
-    print(f"    Safe for fp16: {result.reduction_analysis.safe_for_fp16}")
-
-    print(f"\n  Accumulation (10k steps):")
-    print(f"    Path 1 (cast):  {result.accumulation_analysis.weight_cast_drift.steady_state_bound:.2e}")
-    print(f"    Path 2 (Adam):  {result.accumulation_analysis.optimizer_state_ema.steady_state_bound:.2e}")
-    print(f"    Path 3 (divergence): {result.accumulation_analysis.cross_rank_weight_diff:.2e}")
-
-    print(f"\n  Overflow risks:")
-    for risk in result.overflow_risks:
-        print(f"    {risk.risk_level}: {risk.name} (magnitude ~{risk.typical_magnitude:.1e})")
-
-    print(f"\n  Verdict: {'SAFE' if result.is_safe else 'UNSAFE'}")
-    return result.is_safe
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# V8: Multi-layer accumulation over training steps
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def v8_accumulation_over_training():
-    """Error accumulation for full GPT-2 training over 100k steps."""
-    print("\n" + "=" * 70)
-    print("  V8: Numerical — GPT-2 Accumulation Over 100k Training Steps")
-    print("=" * 70)
-
-    acc = ErrorAccumulator(Dtype.FP16, Dtype.FP32, n_ranks=2,
-                           allreduce_topology="tree")
-
-    configs = [
-        ("FP16 compute + FP32 AR (standard)", Dtype.FP16, Dtype.FP32),
-        ("FP16 compute + FP16 AR (dangerous)", Dtype.FP16, Dtype.FP16),
-        ("BF16 compute + FP32 AR", Dtype.BF16, Dtype.FP32),
-    ]
-
-    G = 1e-3  # typical gradient magnitude for GPT-2
-
-    print(f"  Typical |g| ≈ {G:.1e}, T=100k steps, lr=1e-4")
-    print(f"  {'Config':<35} {'Cross-Rank Div':>14} {'Risk':>20}")
-    print(f"  {'-'*35} {'-'*14} {'-'*20}")
-
-    for name, comp, accum in configs:
-        a = ErrorAccumulator(comp, accum, 2, "tree")
-        analysis = a.analyze(num_steps=100000, learning_rate=1e-4,
-                             typical_grad_magnitude=G)
-        print(f"  {name:<35} {analysis.cross_rank_weight_diff:>14.2e} "
-              f"{analysis.risk_level:>20}")
-
-    # Show dominant error source
-    a = ErrorAccumulator(Dtype.FP16, Dtype.FP32, 2, "tree")
-    analysis = a.analyze(num_steps=100000, learning_rate=1e-4,
-                         typical_grad_magnitude=G)
-
-    p1 = analysis.weight_cast_drift.steady_state_bound
-    p3 = analysis.cross_rank_weight_diff
-    dominant = "Cross-Precision Cast" if p1 > p3 else "Cross-Rank Divergence"
-
-    print(f"\n  Dominant error source: {dominant}")
-    print(f"    Path 1 (cast drift):    {p1:.2e} — bounded")
-    print(f"    Path 3 (cross-rank):    {p3:.2e} — linear with T")
-    print(f"  Verdict: {analysis.risk_level}")
-
-    return True
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     print("\n" + "=" * 70)
     print("  LLM-INFRA-VERIFIER: Megatron GPT-2 Verification")
-    print("  Full-stack: Spatial + Temporal + Numerical + Resource")
+    print("  Spatial + Temporal")
     print("=" * 70)
 
     results = {}
@@ -483,9 +317,6 @@ if __name__ == "__main__":
     results["V3"] = v3_missing_mlp_allreduce()
     results["V4"] = v4_gelu_on_sharded_bug()
     results["V5"] = v5_async_gradient_race()
-    results["V6"] = v6_gpt2_memory_planning()
-    results["V7"] = v7_numerical_safety()
-    results["V8"] = v8_accumulation_over_training()
 
     print("\n" + "=" * 70)
     print("  VERIFICATION SUMMARY: Megatron GPT-2")

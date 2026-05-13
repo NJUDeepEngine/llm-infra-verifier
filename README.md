@@ -1,11 +1,10 @@
 # LLM-Infra-Verifier
 
 > **Static verification framework for distributed LLM training infrastructure.**
-> Catch placement bugs, communication races, numerical drift, and OOM —
-> before you launch a single GPU job.
+> Catch placement bugs and communication races — before you launch a single GPU job.
 
 [![Tests](https://img.shields.io/badge/tests-42%20passed-green)]()
-[![Benchmarks](https://img.shields.io/badge/benchmarks-49%20cases%20%7C%20100%25%20detection-blue)]()
+[![Benchmarks](https://img.shields.io/badge/benchmarks-35%20cases%20%7C%20100%25%20detection-blue)]()
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)]()
 [![License](https://img.shields.io/badge/license-Apache%202.0-orange)]()
 
@@ -20,16 +19,14 @@ Distributed training bugs are **silent, intermittent, and catastrophic at scale*
 | Missing AllReduce | Wrong gradients, silently diverging weights | Only if you compare against single-GPU baseline |
 | GELU on sharded tensor | Numerically wrong but structurally valid output | Only if you check mathematical equivalence |
 | Async AllReduce without Wait | Race condition — works on some GPUs, fails on others | Flaky, CI-unfriendly |
-| fp16 Adam state underflow | Optimizer silently stops updating | After thousands of steps of no progress |
-| Activation memory > HBM | OOM halfway through training | After wasting GPU hours |
 
 **This verifier catches them all at compile time — in milliseconds, with zero GPUs.**
 
 ---
 
-## Four-Dimensional Verification
+## Two-Dimensional Verification
 
-The core insight: verify **what**, **when**, **how precise**, and **does it fit** — as independent dimensions.
+The core insight: verify **what** and **when** — as independent dimensions.
 
 ```
                          Input Source
@@ -38,31 +35,19 @@ The core insight: verify **what**, **when**, **how precise**, and **does it fit*
                              ▼
                    ┌─────────────────┐
                    │  Verification IR │  Unified intermediate representation
-                   │  (ir.py, 35 ops) │  Symbolic, not numeric
+                   │  (ir.py, 20 ops) │  Symbolic, not numeric
                    └────────┬────────┘
                             │
-        ┌───────────────────┼───────────────────┐
-        ▼                   ▼                   ▼
-┌───────────────┐   ┌───────────────┐   ┌───────────────┐
-│   SPATIAL     │   │   TEMPORAL    │   │   NUMERICAL   │
-│ Where things  │   │ When things   │   │ How precise   │
-│   go          │   │   happen      │   │               │
-│               │   │               │   │               │
-│ Z3 SMT solver │   │ HB graph + Z3 │   │ IEEE 754      │
-│ 6 checks      │   │ 4 checks      │   │ analytical     │
-└───────┬───────┘   └───────┬───────┘   └───────┬───────┘
-        │                   │                   │
-        └───────────────────┼───────────────────┘
-                            │
-                            ▼
-                   ┌─────────────────┐
-                   │    RESOURCE     │
-                   │  Does it fit?   │
-                   │                 │
-                   │ Memory graph    │
-                   │ HBM→Shared→Reg  │
-                   │ Occupancy calc  │
-                   └─────────────────┘
+              ┌─────────────┴─────────────┐
+              ▼                           ▼
+      ┌───────────────┐           ┌───────────────┐
+      │   SPATIAL     │           │   TEMPORAL    │
+      │ Where things  │           │ When things   │
+      │   go          │           │   happen      │
+      │               │           │               │
+      │ Z3 SMT solver │           │ HB graph + Z3 │
+      │ 6 checks      │           │ 4 checks      │
+      └───────────────┘           └───────────────┘
 ```
 
 ### Spatial: "Where does each tensor go?"
@@ -84,23 +69,6 @@ The core insight: verify **what**, **when**, **how precise**, and **does it fit*
 | Missing Wait | Async output consumed before `Wait(handle)` | Handle-waited_by analysis |
 | Buffer aliasing | Two async ops writing same buffer concurrently | Write-after-write check |
 | Dependency violation | Recv before Send for same (src,dst,mb) | HB ordering constraint |
-
-### Numerical: "How much error can accumulate?"
-
-| Pathway | Accumulation type | Bound |
-|---------|------------------|-------|
-| Weight cast drift | **None** (per-step independent) | ≤ ε_cast, regardless of T |
-| Optimizer EMA state | **Bounded** (converges to input error) | ≤ g_error |
-| Cross-rank divergence | **Linear** (unbounded, grows with T) | ≤ T × lr × ε_ar × |g| |
-
-### Resource: "Does it fit in GPU memory?"
-
-| Level | Capacity (H100) | What we check |
-|-------|-----------------|---------------|
-| HBM | 80 GB | Peak live tensors + params + optimizer + activations |
-| Shared memory | 228 KB/SM | Per-block shared mem × concurrent blocks |
-| Registers | 65536/SM | Per-thread regs × threads/block |
-| Occupancy | 2048 threads/SM | Bottleneck analysis (threads vs regs vs shared) |
 
 ---
 
@@ -153,50 +121,28 @@ Data dependency: complete_writer < issue_reader
 
 Z3 checks: "Does there exist a schedule where two unordered ops on different streams overlap on the same buffer?" If yes → race.
 
-### 4. IEEE 754 bounds for numerical analysis
-
-We don't simulate training. We compute worst-case error bounds from first principles:
-
-```
-fp32 AllReduce (tree, N=256):  ε ≤ 0.5·2^(-23) · log₂(256) = 9.54e-7
-fp16 AllReduce (tree, N=256):  ε ≤ 0.5·2^(-10) · log₂(256) = 3.91e-3
-fp32→fp16 cast:                ε ≤ 0.5·2^(-10) = 4.88e-4  (DOMINANT)
-
-Cross-rank divergence after T steps:  |Δθ| ≤ T × lr × ε_ar × |g|
-```
-
-These bounds are **valid for ALL inputs** — conservative but never miss a violation.
-
-### 5. Memory graph for resource analysis
-
-Each tensor is a node with a **lifetime** `[first_use, last_use]`. At each program point we sum live tensors and compare against hardware limits. Same idea as register allocation, but for GPU HBM.
-
 ---
 
 ## Project Structure
 
 ```
 verifier/
-├── state.py           # TensorState, ShardingSpec, DeviceMesh (248 lines)
-├── ir.py              # 35 op types with fwd+VJP (~1400 lines)
-├── executor.py        # Multi-device symbolic executor (316 lines)
-├── autograd.py        # VJP autograd + gradient duality (368 lines)
+├── state.py           # TensorState, ShardingSpec, DeviceMesh
+├── ir.py              # 20 op types with fwd+VJP
+├── executor.py        # Multi-device symbolic executor
+├── autograd.py        # VJP autograd + gradient duality
 │
-├── solver.py          # Z3 spatial verifier, 6 checks (572 lines)
-├── temporal.py        # HB graph + Z3 race detection, 4 checks (~580 lines)
-├── numerical.py       # IEEE 754 error model, 3-pathway accumulation (~800 lines)
+├── solver.py          # Z3 spatial verifier, 6 checks
+├── temporal.py        # HB graph + Z3 race detection, 4 checks
 │
-├── hardware.py        # H100/H200/B200/A100 GPU specs (~300 lines)
-├── memory_graph.py    # Memory graph builder + OOM detector (~400 lines)
-│
-├── rewrite.py         # Pattern matching, rewrite rules, cost model (574 lines)
-├── synthesis.py       # Verified parallelization synthesis (539 lines)
-├── llm_frontend.py    # PyTorch → IR via LLM + feedback loop (658 lines)
-├── tir_lifter.py      # TileLang TIR → distributed IR (656 lines)
-└── schedules.py       # 1F1B schedule + deadlock checker (397 lines)
+├── rewrite.py         # Pattern matching, rewrite rules, cost model
+├── synthesis.py       # Verified parallelization synthesis
+├── llm_frontend.py    # PyTorch → IR via LLM + feedback loop
+├── tir_lifter.py      # TileLang TIR → distributed IR
+└── schedules.py       # 1F1B schedule + deadlock checker
 
-examples/              # 8 runnable demos
-benchmarks/            # 33 cases across 4 suites
+examples/              # 6 runnable demos
+benchmarks/            # 35 cases across 3 suites
 tests/                 # 42 tests
 docs/                  # GitHub Pages documentation
 ```
@@ -243,37 +189,11 @@ result = verify_temporal(prog)
 # Detected: MISSING_WAIT on tensor 'y'
 ```
 
-### Check numerical safety for your training config (numerical)
-
-```python
-from verifier.numerical import verify_numerical, Dtype, ZeROStage
-
-result = verify_numerical(
-    n_ranks=256, topology="tree",
-    compute_dtype=Dtype.FP16, accumulate_dtype=Dtype.FP32,
-    optimizer="adam", zero_stage=ZeROStage.ZERO1,
-    hidden_dim=4096, num_layers=32, batch_size=128,
-)
-print(result.summary())
-# Shows: reduction error, 3-pathway accumulation, overflow risks, optimizer safety
-```
-
-### Check if your model fits in GPU memory (resource)
-
-```python
-from verifier.hardware import H100_SXM
-from verifier.memory_graph import estimate_llm_memory
-
-mem = estimate_llm_memory(hidden_dim=8192, num_layers=80, tp_size=8)
-fits = mem["total"] / (1024**3) < H100_SXM.total_hbm_gb
-print(f"Llama-70B on H100: {'FITS' if fits else 'OOM'} ({mem['total']/(1024**3):.1f}GB)")
-```
-
 ---
 
 ## Demos & Benchmarks
 
-### Examples (8 demo scripts)
+### Examples (6 demo scripts)
 
 ```bash
 # Spatial
@@ -285,17 +205,11 @@ python examples/cp_ring_attn.py    # Ring Attention with FlashAttention
 # Temporal
 python examples/overlap_demo.py    # 5 cases: race, missing wait, buffer alias
 
-# Numerical
-python examples/numerical_demo.py  # 7 sections: dtype, cast, reduction, accumulation
-
-# Resource/OOM
-python examples/oom_demo.py        # 6 sections: GPU specs, LLM memory, occupancy
-
 # Synthesis + LLM
 python examples/synthesis_demo.py  # Auto-synthesis + LLM extraction flow
 ```
 
-### Benchmarks (49 cases, 5 suites, 100% detection)
+### Benchmarks (35 cases, 3 suites, 100% detection)
 
 ```bash
 # Suite 1: Synthetic bug patterns (16 cases from PyTorch/Megatron/TileLang GitHub issues)
@@ -304,14 +218,9 @@ python benchmarks/benchmark_suite.py
 # Suite 2: Real-code validation (8 cases lifted from Megatron-LM + TileLang source)
 python benchmarks/real_code_validation.py
 
-# Suite 3: Real-bug benchmark (16 cases with original buggy code + translation notes)
-#          9 from PyTorch/Megatron, 7 from TileLang/Triton
+# Suite 3: Real-bug benchmark (11 cases with original buggy code + translation notes)
 python benchmarks/real_bug_benchmark.py
 
-# Suite 4: Numerical benchmark (9 cases: IEEE 754 bounds + accumulation analysis)
-python benchmarks/numerical_benchmark.py
-
-# Suite 5 (part of Suite 1): Pure spatial + temporal + schedule checks
 python benchmarks/benchmark_suite.py --list   # List all 16 cases by category
 python benchmarks/benchmark_suite.py --run B1 # Run specific category
 python benchmarks/benchmark_suite.py --json   # JSON output
@@ -347,13 +256,9 @@ We don't sample specific tensor values. We verify properties (placement correctn
 
 ### 3. Dimensions are orthogonal — verify independently, compose results
 
-Spatial correctness doesn't imply temporal safety. Temporal safety doesn't imply numerical stability. Each dimension has its own verification technique, and a program is only fully verified when all four pass.
+Spatial correctness doesn't imply temporal safety. Each dimension has its own verification technique, and a program is only fully verified when both pass.
 
-### 4. Conservative bounds over empirical estimates
-
-Our numerical error bounds are **worst-case analytical** (IEEE 754 + Higham). They may overestimate error in practice, but they will **never miss a real violation**. For safety-critical infrastructure, this is the right trade-off.
-
-### 5. Pattern library over ad-hoc rules
+### 4. Pattern library over ad-hoc rules
 
 Known distributed patterns (RowParallel, ColumnParallel, 1F1B, Ring Attention) are first-class citizens. This enables:
 - **Detection**: recognize when a pattern is used incorrectly (e.g., GELU between Colwise and Rowwise without AllGather)
@@ -364,14 +269,11 @@ Known distributed patterns (RowParallel, ColumnParallel, 1F1B, Ring Attention) a
 
 ## Verification Coverage Matrix
 
-| | Spatial | Temporal | Numerical | Resource |
-|---|---|---|---|---|
-| **Tensor Parallelism** | ✓ placement, postcond | ✓ async AR gradient | ✓ AR error, cast | ✓ HBM, shared mem |
-| **Pipeline Parallelism** | ✓ Send/Recv match | ✓ 1F1B schedule order | ✓ | ✓ activation liveness |
-| **Context Parallelism** | ✓ ring order | ✓ async ring comm | ✓ | ✓ |
-| **Data Parallelism** | ✓ gradient duality | ✓ async AR | ✓ cross-rank div | ✓ |
-| **ZeRO-1/2/3** | ✓ shard consistency | ✓ ReduceScatter | ✓ shard boundary drift | ✓ |
-| **Mixed Precision** | — | — | ✓ fp16/bf16 bounds | — |
-| **Adam/AdamW** | — | — | ✓ state invariants | ✓ optimizer memory |
-| **FlashAttention** | ✓ CP placement | ✓ async overlap | — | ✓ shared mem occupancy |
-| **H100/B200 GPUs** | — | — | — | ✓ per-SM limits |
+| | Spatial | Temporal |
+|---|---|---|
+| **Tensor Parallelism** | ✓ placement, postcond | ✓ async AR gradient |
+| **Pipeline Parallelism** | ✓ Send/Recv match | ✓ 1F1B schedule order |
+| **Context Parallelism** | ✓ ring order | ✓ async ring comm |
+| **Data Parallelism** | ✓ gradient duality | ✓ async AR |
+| **ZeRO-1/2/3** | ✓ shard consistency | ✓ ReduceScatter |
+| **FlashAttention** | ✓ CP placement | ✓ async overlap |

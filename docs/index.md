@@ -50,10 +50,8 @@ Every verification capability is validated against **actual implementations**:
 
 | Metric | Value |
 |---|---|
-| Python files | 22 |
-| Lines of code | ~10,000 |
 | Tests | 42 (all passing) |
-| Benchmark cases | 24 (100% detection) |
+| Benchmark cases | 35 (100% detection) |
 | Verification dimensions | Spatial (6 checks) + Temporal (4 checks) |
 | Parallelism types | TP, PP, CP (forward + backward) |
 
