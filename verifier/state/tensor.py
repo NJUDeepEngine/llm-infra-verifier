@@ -6,11 +6,11 @@ symbolic expression, and autograd/pipeline annotations.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, Tuple
 
 from .placement import LocalSPMDType, Shard
-from .sharding import ShardingSpec
+from .sharding import ShardingSpec, compute_local_shape
 
 
 @dataclass
@@ -34,13 +34,27 @@ class TensorState:
 
     def __post_init__(self):
         """Auto-derive SPMD local_type from sharding if not explicitly set."""
+        # INVARIANT 无法从 placement 自动推导（placement 层没有 Invariant 类型）。
+        # INVARIANT 只能通过 Reinterpret(R->I, expert_mode=True) 显式设置。
+        # 在 placement 层，INVARIANT tensor 的 sharding 为 Replicate()。
         if self.local_type is None:
+            # Priority: Partial > Varying > Replicate
+            # Partial 优先：表示"有待求和"，是影响 AllReduce 正确性的关键属性。
+            # 对于混合 placement 如 (Shard(0), Partial())，Partial 决定语义。
             if self.sharding.partial:
-                object.__setattr__(self, 'local_type', LocalSPMDType.PARTIAL)
+                self.local_type = LocalSPMDType.PARTIAL
             elif not any(isinstance(p, Shard) for p in self.sharding.placements):
-                object.__setattr__(self, 'local_type', LocalSPMDType.REPLICATE)
+                self.local_type = LocalSPMDType.REPLICATE
             else:
-                object.__setattr__(self, 'local_type', LocalSPMDType.VARYING)
+                self.local_type = LocalSPMDType.VARYING
+
+        expected = compute_local_shape(self.global_shape, self.sharding)
+        if self.local_shape != expected:
+            raise ValueError(
+                f"TensorState '{self.name}': local_shape {self.local_shape} "
+                f"!= computed {expected} from global_shape={self.global_shape}, "
+                f"placements={self.sharding.placements}"
+            )
 
     requires_grad: bool = False
     grad: Optional[TensorState] = None
@@ -90,52 +104,33 @@ class TensorState:
         return self.is_replicate or self.is_invariant
 
     def with_local_type(self, lt: LocalSPMDType) -> "TensorState":
-        """Return copy with different local SPMD type."""
-        return TensorState(
-            name=self.name, global_shape=self.global_shape,
-            local_shape=self.local_shape, sharding=self.sharding,
-            expr=self.expr, local_type=lt,
-            requires_grad=self.requires_grad, grad=self.grad,
-            grad_name=self.grad_name, stage=self.stage,
-            microbatch_id=self.microbatch_id, is_activation=self.is_activation,
-            cp_rank=self.cp_rank, _async_handle=self._async_handle,
-        )
+        """Return copy with different local SPMD type.
+
+        WARNING: local_type may disagree with the placement-derived type.
+        Only use in SPMD-specific ops (Reinterpret, Convert).
+        """
+        return replace(self, local_type=lt)
 
     def with_name(self, name: str) -> TensorState:
         """Return a copy with a different name."""
-        return TensorState(
-            name=name,
-            global_shape=self.global_shape,
-            local_shape=self.local_shape,
-            sharding=self.sharding,
-            expr=self.expr,
-            requires_grad=self.requires_grad,
-            grad=self.grad,
-            grad_name=self.grad_name,
-            stage=self.stage,
-            microbatch_id=self.microbatch_id,
-            is_activation=self.is_activation,
-            cp_rank=self.cp_rank,
-            _async_handle=self._async_handle,
-        )
+        return replace(self, name=name)
 
     def grad_tensor(self, name: str = "") -> TensorState:
         """Create a gradient tensor corresponding to this tensor."""
-        gname = name or f"grad_{self.name}"
-        return TensorState(
-            name=gname,
-            global_shape=self.global_shape,
-            local_shape=self.local_shape,
-            sharding=self.sharding,
+        return replace(
+            self,
+            name=name or f"grad_{self.name}",
             expr=f"grad({self.expr})" if self.expr else "",
             requires_grad=False,
+            grad=None,
             grad_name="",
-            stage=self.stage,
-            microbatch_id=self.microbatch_id,
-            cp_rank=self.cp_rank,
+            _async_handle=None,
+            is_activation=False,
         )
 
     def __hash__(self):
+        # device_ids 不参与 hash：同一逻辑 mesh (shape + dim_names) 的不同物理映射
+        # 应视为等价。device_ids 仅影响执行时的设备分配，不影响语义。
         return hash((
             self.name,
             self.global_shape,

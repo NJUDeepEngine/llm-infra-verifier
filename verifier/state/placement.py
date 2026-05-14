@@ -31,13 +31,15 @@ class LocalSPMDType(Enum):
 
     def gradient_type(self) -> "LocalSPMDType":
         """Return the gradient's local type (backward dual)."""
-        dual = {
-            LocalSPMDType.REPLICATE: LocalSPMDType.PARTIAL,
-            LocalSPMDType.INVARIANT: LocalSPMDType.INVARIANT,
-            LocalSPMDType.VARYING: LocalSPMDType.VARYING,
-            LocalSPMDType.PARTIAL: LocalSPMDType.REPLICATE,
-        }
-        return dual[self]
+        return _SPMD_GRADIENT_DUAL[self]
+
+
+_SPMD_GRADIENT_DUAL = {
+    LocalSPMDType.REPLICATE: LocalSPMDType.PARTIAL,
+    LocalSPMDType.INVARIANT: LocalSPMDType.INVARIANT,
+    LocalSPMDType.VARYING: LocalSPMDType.VARYING,
+    LocalSPMDType.PARTIAL: LocalSPMDType.REPLICATE,
+}
 
 
 @dataclass(frozen=True)
@@ -49,14 +51,12 @@ class Shard:
     """
     dim: int
 
+    def __post_init__(self):
+        if self.dim < 0:
+            raise ValueError(f"Shard dim must be >= 0, got {self.dim}")
+
     def __repr__(self):
         return f"Shard({self.dim})"
-
-
-class PlacementType(Enum):
-    REPLICATE = "replicate"
-    SHARD = "shard"
-    PARTIAL = "partial"
 
 
 @dataclass(frozen=True)

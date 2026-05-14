@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from itertools import combinations
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 
 @dataclass
@@ -44,29 +44,27 @@ class DeviceTopology:
     nodes: List[DeviceNode] = field(default_factory=list)
     links: List[Link] = field(default_factory=list)
 
+    def __post_init__(self):
+        self._adj: Dict[int, Set[int]] = {}
+        for n in self.nodes:
+            self._adj[n.device_id] = set()
+        for link in self.links:
+            self._adj.setdefault(link.src, set()).add(link.dst)
+            self._adj.setdefault(link.dst, set()).add(link.src)
+
     def device_ids(self) -> List[int]:
         return [n.device_id for n in self.nodes]
 
     def neighbors(self, device_id: int) -> List[int]:
-        result = []
-        for link in self.links:
-            if link.src == device_id:
-                result.append(link.dst)
-            elif link.dst == device_id:
-                result.append(link.src)
-        return result
+        return list(self._adj.get(device_id, []))
 
     def are_connected(self, d1: int, d2: int) -> bool:
-        return any(
-            (link.src == d1 and link.dst == d2) or
-            (link.src == d2 and link.dst == d1)
-            for link in self.links
-        )
+        return d2 in self._adj.get(d1, set())
 
     def all_connected(self, device_ids: List[int]) -> bool:
         """Check if all given devices form a fully connected group."""
         for d1, d2 in combinations(device_ids, 2):
-            if not self.are_connected(d1, d2):
+            if d2 not in self._adj.get(d1, set()):
                 return False
         return True
 
@@ -122,6 +120,9 @@ class DeviceMesh:
                 f"device_ids length {len(self.device_ids)} != "
                 f"num_devices {self.num_devices}"
             )
+        self._id_to_flat: Dict[int, int] = {
+            did: flat for flat, did in enumerate(self.device_ids)
+        }
 
     @property
     def num_devices(self) -> int:
@@ -143,6 +144,12 @@ class DeviceMesh:
         """
         if len(coords) != self.ndim:
             raise ValueError(f"Expected {self.ndim} coords, got {len(coords)}")
+        for i, c in enumerate(coords):
+            if not (0 <= c < self.shape[i]):
+                raise ValueError(
+                    f"Coordinate {c} out of range [0, {self.shape[i]}) "
+                    f"for mesh dimension '{self.dim_names[i]}'"
+                )
         flat = 0
         for i, c in enumerate(coords):
             flat = flat * self.shape[i] + c
@@ -150,7 +157,9 @@ class DeviceMesh:
 
     def device_to_coord(self, device_id: int) -> Tuple[int, ...]:
         """Map a physical device ID back to logical mesh coordinates."""
-        flat = self.device_ids.index(device_id)
+        flat = self._id_to_flat.get(device_id)
+        if flat is None:
+            raise ValueError(f"Device {device_id} not in mesh")
         coords = []
         for dim_size in reversed(self.shape):
             coords.append(flat % dim_size)
@@ -163,18 +172,10 @@ class DeviceMesh:
         E.g., for mesh (2,4), mesh_dim=0, index=0:
           returns devices at coords (0,0),(0,1),(0,2),(0,3).
         """
-        result = []
-        n = self.num_devices
-        for flat in range(n):
-            coords = []
-            tmp = flat
-            for dim_size in reversed(self.shape):
-                coords.append(tmp % dim_size)
-                tmp //= dim_size
-            coords = list(reversed(coords))
-            if coords[mesh_dim] == index:
-                result.append(self.device_ids[flat])
-        return result
+        return [
+            did for did in self.device_ids
+            if self.device_to_coord(did)[mesh_dim] == index
+        ]
 
     def validate_topology(self) -> List[str]:
         """Check that each communication group has full connectivity."""

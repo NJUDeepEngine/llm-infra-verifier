@@ -7,7 +7,7 @@ compute_local_shape / compute_tensor_slices derive per-device views.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 from .placement import Placement, Shard, Partial
 from .device import DeviceMesh
@@ -33,28 +33,20 @@ class ShardingSpec:
     def partial(self) -> bool:
         return any(isinstance(p, Partial) for p in self.placements)
 
-    def get_shard_dims(self) -> Dict[int, int]:
-        """Return {tensor_dim: mesh_dim} for all Shard placements."""
-        result = {}
+    def get_shard_dims(self) -> Dict[int, List[int]]:
+        """Return {tensor_dim: [mesh_dims]} for all Shard placements.
+
+        Supports double-sharding: a tensor dim sharded across multiple mesh axes.
+        """
+        result: Dict[int, List[int]] = {}
         for mesh_dim, p in enumerate(self.placements):
             if isinstance(p, Shard):
-                result[p.dim] = mesh_dim
+                result.setdefault(p.dim, []).append(mesh_dim)
         return result
 
     def __repr__(self):
         placements_str = ", ".join(repr(p) for p in self.placements)
         return f"ShardingSpec(({placements_str},), mesh={self.mesh})"
-
-
-@dataclass
-class AccessPattern:
-    """Describes how a buffer is accessed in a TIR block.
-
-    Maps each buffer dimension to the loop variable that indexes it,
-    used to determine how sharding interacts with compute.
-    """
-    buffer_name: str
-    indices: Tuple[str, ...]
 
 
 def compute_local_shape(
@@ -118,25 +110,17 @@ def compute_tensor_slices(
     Returns {device_id: TensorSlice} for all devices in the mesh.
     """
     mesh = spec.mesh
-    n_devices = mesh.num_devices
     local_shape = compute_local_shape(global_shape, spec)
 
     result = {}
-    for flat_id in range(n_devices):
-        coords = []
-        tmp = flat_id
-        for dim_size in reversed(mesh.shape):
-            coords.append(tmp % dim_size)
-            tmp //= dim_size
-        coords = list(reversed(coords))
-
+    for device_id in mesh.device_ids:
+        coords = mesh.device_to_coord(device_id)
         offsets = [0] * len(global_shape)
         for mesh_dim, p in enumerate(spec.placements):
             if isinstance(p, Shard):
                 chunk = global_shape[p.dim] // mesh.shape[mesh_dim]
                 offsets[p.dim] = coords[mesh_dim] * chunk
 
-        device_id = mesh.device_ids[flat_id]
         result[device_id] = TensorSlice(
             device_id=device_id,
             global_shape=global_shape,

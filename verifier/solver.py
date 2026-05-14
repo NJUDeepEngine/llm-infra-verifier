@@ -26,7 +26,6 @@ from .state import (
     Replicate,
     Partial,
     Placement,
-    PlacementType,
 )
 from .ir import (
     IROp,

@@ -1,5 +1,4 @@
 from .state import (
-    PlacementType,
     Shard,
     Replicate,
     Partial,
@@ -11,7 +10,6 @@ from .state import (
     ShardingSpec,
     TensorState,
     TensorSlice,
-    AccessPattern,
     compute_local_shape,
     compute_tensor_slices,
 )

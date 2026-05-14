@@ -12,7 +12,6 @@ TensorSlice tracks which slice of a global tensor each device holds.
 from .placement import (
     LocalSPMDType,
     Shard,
-    PlacementType,
     Replicate,
     Partial,
     Placement,
@@ -27,7 +26,6 @@ from .device import (
 
 from .sharding import (
     ShardingSpec,
-    AccessPattern,
     compute_local_shape,
     TensorSlice,
     compute_tensor_slices,
@@ -39,11 +37,11 @@ from .tensor import (
 
 __all__ = [
     # placement
-    "LocalSPMDType", "Shard", "PlacementType", "Replicate", "Partial", "Placement",
+    "LocalSPMDType", "Shard", "Replicate", "Partial", "Placement",
     # device
     "DeviceNode", "Link", "DeviceTopology", "DeviceMesh",
     # sharding
-    "ShardingSpec", "AccessPattern", "compute_local_shape",
+    "ShardingSpec", "compute_local_shape",
     "TensorSlice", "compute_tensor_slices",
     # tensor
     "TensorState",

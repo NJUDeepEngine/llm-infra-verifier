@@ -19,9 +19,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pytest
 from verifier.state import (
     LocalSPMDType,
-    Shard, Replicate, Partial, Placement, PlacementType,
+    Shard, Replicate, Partial, Placement,
     DeviceNode, Link, DeviceTopology, DeviceMesh,
-    ShardingSpec, AccessPattern, compute_local_shape,
+    ShardingSpec, compute_local_shape,
     TensorSlice, compute_tensor_slices,
     TensorState,
 )
