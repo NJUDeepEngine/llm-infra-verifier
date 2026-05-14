@@ -59,6 +59,31 @@ from .spmd import (
     SPMDGuard,
 )
 
+from .precision import (
+    Cast,
+    LossScale,
+    DtypeGuard,
+)
+
+from .zero import (
+    ZeROGatherParam,
+    ZeROScatterGrad,
+    ZeROPartitionOptState,
+)
+
+from .cp import (
+    RingRotate,
+    RingAttentionStep,
+    RingAttention,
+)
+
+from .moe import (
+    TopKGate,
+    MoEDispatch,
+    MoECombine,
+    ExpertCompute,
+)
+
 from .program import (
     Program,
     ir_to_str,
@@ -81,6 +106,14 @@ __all__ = [
     "Reshape", "Transpose",
     # spmd
     "Reinterpret", "Convert", "SPMDGuard",
+    # precision
+    "Cast", "LossScale", "DtypeGuard",
+    # zero
+    "ZeROGatherParam", "ZeROScatterGrad", "ZeROPartitionOptState",
+    # cp
+    "RingRotate", "RingAttentionStep", "RingAttention",
+    # moe
+    "TopKGate", "MoEDispatch", "MoECombine", "ExpertCompute",
     # program
     "Program", "ir_to_str",
 ]

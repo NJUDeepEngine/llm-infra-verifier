@@ -48,6 +48,18 @@ from .ir import (
     OverlapRegion,
     Reinterpret,
     Convert,
+    Cast,
+    LossScale,
+    ZeROGatherParam,
+    ZeROScatterGrad,
+    ZeROPartitionOptState,
+    RingRotate,
+    RingAttentionStep,
+    RingAttention,
+    TopKGate,
+    MoEDispatch,
+    MoECombine,
+    ExpertCompute,
 )
 
 
@@ -226,6 +238,27 @@ class MultiDeviceExecutor:
         elif isinstance(op, OverlapRegion):
             self._exec_overlap(op)
         elif isinstance(op, (Reinterpret, Convert)):
+            self._exec_unary(op)
+        elif isinstance(op, (Cast, LossScale)):
+            self._exec_unary(op)
+        elif isinstance(op, ZeROGatherParam):
+            self._exec_allgather(op)
+        elif isinstance(op, ZeROScatterGrad):
+            self._exec_reducescatter(op)
+        elif isinstance(op, ZeROPartitionOptState):
+            self._exec_unary(op)
+        elif isinstance(op, RingRotate):
+            self._exec_ring_rotate(op)
+        elif isinstance(op, RingAttentionStep):
+            self._exec_flash_attn(op)
+        elif isinstance(op, RingAttention):
+            for sub in op.expand():
+                self._execute_op(sub)
+        elif isinstance(op, TopKGate):
+            self._exec_topk_gate(op)
+        elif isinstance(op, (MoEDispatch, MoECombine)):
+            self._exec_collective_unary(op)
+        elif isinstance(op, ExpertCompute):
             self._exec_unary(op)
         else:
             raise ValueError(
@@ -475,6 +508,38 @@ class MultiDeviceExecutor:
         local_ctx = {op.x: x} if x else {}
         result = self._apply_op(op, local_ctx)
         dst_dev.set(result)
+
+    def _exec_ring_rotate(self, op: RingRotate):
+        """Ring rotation: each device gets tensor from (rank-1) % ring_size."""
+        current = {}
+        for did, dev in self.devices.items():
+            x = dev.get(op.x)
+            if x is not None:
+                current[did] = copy.deepcopy(x)
+
+        for did, dev in self.devices.items():
+            src = (did - 1) % op.ring_size
+            if src in current:
+                rotated = copy.deepcopy(current[src])
+                rotated.name = op.output
+                rotated.ring_step = (current[src].ring_step or 0) + 1
+                if op.handle:
+                    rotated._async_handle = op.handle
+                dev.set(rotated)
+
+    def _exec_topk_gate(self, op: TopKGate):
+        """TopKGate: dual-output (weights + indices) on all devices."""
+        for did, dev in self.devices.items():
+            x = dev.get(op.x)
+            gw = dev.get(op.gate_weight)
+            if x is None or gw is None:
+                continue
+            local_ctx = {op.x: x, op.gate_weight: gw}
+            result = self._apply_op(op, local_ctx)
+            dev.set(result)
+            indices = local_ctx.get(op.indices_output)
+            if indices is not None:
+                dev.set(indices)
 
     def _exec_overlap(self, op: OverlapRegion):
         """Execute an overlap region: run compute and comm ops."""

@@ -37,6 +37,11 @@ from .ir import (
     Reshape,
     Transpose,
     FlashAttention,
+    ZeROGatherParam,
+    ZeROScatterGrad,
+    RingRotate,
+    MoEDispatch,
+    MoECombine,
 )
 
 
@@ -258,6 +263,63 @@ class AutogradEngine:
                     microbatch_id=op.microbatch_id,
                 )
 
+        elif isinstance(op, ZeROGatherParam):
+            input_name = op.input_names[0]
+            grad_tensor = grad_inputs.get(input_name)
+            if grad_tensor:
+                return ZeROScatterGrad(
+                    x=grad_tensor.name,
+                    output=f"{grad_tensor.name}_scattered",
+                    scatter_dim=op.gather_dim,
+                    zero_stage=op.zero_stage,
+                )
+
+        elif isinstance(op, ZeROScatterGrad):
+            input_name = op.input_names[0]
+            grad_tensor = grad_inputs.get(input_name)
+            if grad_tensor:
+                return ZeROGatherParam(
+                    x=grad_tensor.name,
+                    output=f"{grad_tensor.name}_gathered",
+                    gather_dim=op.scatter_dim,
+                    zero_stage=op.zero_stage,
+                )
+
+        elif isinstance(op, RingRotate):
+            input_name = op.input_names[0]
+            grad_tensor = grad_inputs.get(input_name)
+            if grad_tensor:
+                return RingRotate(
+                    x=grad_tensor.name,
+                    output=f"{grad_tensor.name}_rotated",
+                    ring_size=op.ring_size,
+                    ring_dim=op.ring_dim,
+                )
+
+        elif isinstance(op, MoEDispatch):
+            input_name = op.input_names[0]
+            grad_tensor = grad_inputs.get(input_name)
+            if grad_tensor:
+                return MoECombine(
+                    x=grad_tensor.name,
+                    output=f"{grad_tensor.name}_combined",
+                    num_experts=op.num_experts,
+                    split_dim=op.concat_dim,
+                    concat_dim=op.split_dim,
+                )
+
+        elif isinstance(op, MoECombine):
+            input_name = op.input_names[0]
+            grad_tensor = grad_inputs.get(input_name)
+            if grad_tensor:
+                return MoEDispatch(
+                    x=grad_tensor.name,
+                    output=f"{grad_tensor.name}_dispatched",
+                    num_experts=op.num_experts,
+                    split_dim=op.concat_dim,
+                    concat_dim=op.split_dim,
+                )
+
         return None
 
     def verify_gradient_correctness(
@@ -366,6 +428,24 @@ class AutogradEngine:
             return fwd_op.src == bwd_op.dst and fwd_op.dst == bwd_op.src
         if isinstance(fwd_op, Recv) and isinstance(bwd_op, Send):
             return fwd_op.src == bwd_op.dst and fwd_op.dst == bwd_op.src
+
+        # ZeRO
+        if isinstance(fwd_op, ZeROGatherParam) and isinstance(bwd_op, ZeROScatterGrad):
+            return fwd_op.gather_dim == bwd_op.scatter_dim
+        if isinstance(fwd_op, ZeROScatterGrad) and isinstance(bwd_op, ZeROGatherParam):
+            return fwd_op.scatter_dim == bwd_op.gather_dim
+
+        # Ring
+        if isinstance(fwd_op, RingRotate) and isinstance(bwd_op, RingRotate):
+            return fwd_op.ring_size == bwd_op.ring_size
+
+        # MoE
+        if isinstance(fwd_op, MoEDispatch) and isinstance(bwd_op, MoECombine):
+            return (fwd_op.split_dim == bwd_op.concat_dim and
+                    fwd_op.concat_dim == bwd_op.split_dim)
+        if isinstance(fwd_op, MoECombine) and isinstance(bwd_op, MoEDispatch):
+            return (fwd_op.split_dim == bwd_op.concat_dim and
+                    fwd_op.concat_dim == bwd_op.split_dim)
 
         # SPMD type manipulation
         from .ir import Reinterpret, Convert

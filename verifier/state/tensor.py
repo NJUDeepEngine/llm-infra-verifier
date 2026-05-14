@@ -30,6 +30,8 @@ class TensorState:
     sharding: ShardingSpec
     expr: str = ""
 
+    dtype: Optional[str] = None
+
     local_type: Optional[LocalSPMDType] = field(default=None)
 
     def __post_init__(self):
@@ -65,6 +67,14 @@ class TensorState:
     is_activation: bool = False
 
     cp_rank: Optional[int] = None
+    ring_step: Optional[int] = None
+
+    zero_stage: Optional[int] = None
+    param_group: Optional[str] = None
+
+    expert_id: Optional[int] = None
+    num_experts: Optional[int] = None
+    expert_capacity: Optional[int] = None
 
     _async_handle: Optional[str] = None
 
@@ -87,6 +97,21 @@ class TensorState:
     @property
     def is_partial(self) -> bool:
         return self.local_type == LocalSPMDType.PARTIAL
+
+    @property
+    def is_fp16(self) -> bool:
+        return self.dtype == "fp16"
+
+    @property
+    def is_bf16(self) -> bool:
+        return self.dtype == "bf16"
+
+    @property
+    def is_fp32(self) -> bool:
+        return self.dtype in ("fp32", None)
+
+    def with_dtype(self, dtype: str) -> TensorState:
+        return replace(self, dtype=dtype)
 
     @property
     def gradient_type(self) -> LocalSPMDType:
@@ -135,6 +160,7 @@ class TensorState:
             self.name,
             self.global_shape,
             self.local_shape,
+            self.dtype,
             self.sharding.placements,
             self.sharding.mesh.shape,
             self.sharding.mesh.dim_names,
