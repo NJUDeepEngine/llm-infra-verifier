@@ -179,6 +179,7 @@ class AutogradEngine:
                         global_shape=existing.global_shape,
                         local_shape=existing.local_shape,
                         sharding=existing.sharding,
+                        dtype=existing.dtype,
                         expr=f"({existing.expr} + {grad_tensor.expr})"
                         if existing.expr and grad_tensor.expr
                         else "",
