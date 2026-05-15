@@ -5,12 +5,23 @@ own namespace of tensors; collectives update multiple devices atomically.
 
 This is the runtime that drives the symbolic verification — it propagates
 placements, shapes, and expressions through the full distributed graph.
+
+Dispatch Architecture:
+    _execute_op() uses a registry (_DISPATCH_TABLE) mapping op types to handler
+    methods. Handlers fall into a few categories:
+      - per_device: generic loop over all devices, apply op locally
+      - p2p: cross-device data movement (Send/Recv)
+      - ring: snapshot-then-permute (RingRotate)
+      - expand: recursively execute sub-ops (RingAttention, OverlapRegion)
+      - sync: Wait/WaitAll with multi-output handling
+    New ops only need a registry entry; most map to _exec_per_device.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from enum import Enum
+from typing import Callable, Dict, List, Optional, Tuple, Type
 import copy
 import warnings
 
@@ -66,6 +77,20 @@ from .ir import (
 )
 
 
+# ── Slice propagation rules ──────────────────────────────────────────────────
+
+class SliceRule(Enum):
+    """How to propagate TensorSlice after an op executes."""
+    INHERIT_FIRST = "inherit_first"
+    INHERIT_ANY = "inherit_any"
+    MATMUL = "matmul"
+    ZERO_OFFSET = "zero_offset"
+    NONE = "none"
+
+
+# ── DeviceState ──────────────────────────────────────────────────────────────
+
+
 @dataclass
 class DeviceState:
     """State of a single device, including per-tensor slice info."""
@@ -107,6 +132,9 @@ class DeviceState:
         return f"Device({self.device_id}): {tensor_names}"
 
 
+# ── MultiDeviceExecutor ──────────────────────────────────────────────────────
+
+
 @dataclass
 class MultiDeviceExecutor:
     """Symbolic executor over a device mesh.
@@ -128,6 +156,8 @@ class MultiDeviceExecutor:
             self.devices[i] = DeviceState(device_id=i)
         self._op_history: List[IROp] = []
         self._intermediate_states: List[Dict[int, Dict[str, TensorState]]] = []
+
+    # ── Public API ───────────────────────────────────────────────────────
 
     def register_tensor(
         self,
@@ -178,7 +208,6 @@ class MultiDeviceExecutor:
         """Run a full program on all devices.
 
         Returns the final tensor state (from device 0) for verification.
-        Collectives are broadcast to all participating devices.
         """
         self._op_history.clear()
         self._intermediate_states.clear()
@@ -186,15 +215,10 @@ class MultiDeviceExecutor:
         for op in program.ops:
             self._execute_op(op)
 
-        # Return device 0's view of all tensors
         return dict(self.devices[0].tensors)
 
     def reset_devices(self):
-        """Clear all tensor state from all devices.
-
-        Call this to start fresh without creating a new executor.
-        Note: this also clears registered initial tensors.
-        """
+        """Clear all tensor state from all devices."""
         for dev in self.devices.values():
             dev.tensors.clear()
 
@@ -202,203 +226,115 @@ class MultiDeviceExecutor:
         """Run forward pass only."""
         return self.run_program(program)
 
+    # ── Dispatch ─────────────────────────────────────────────────────────
+
     def _execute_op(self, op: IROp):
-        """Dispatch an op to the appropriate execution method."""
+        """Dispatch an op via the registry table."""
         self._op_history.append(op)
 
-        if isinstance(op, MatMul):
-            self._exec_matmul(op)
-        elif isinstance(op, Add):
-            self._exec_elementwise(op)
-        elif isinstance(op, Multiply):
-            self._exec_elementwise(op)
-        elif isinstance(op, SiLU):
-            self._exec_unary(op)
-        elif isinstance(op, AllReduce):
-            self._exec_allreduce(op)
-        elif isinstance(op, AllGather):
-            self._exec_allgather(op)
-        elif isinstance(op, ReduceScatter):
-            self._exec_reducescatter(op)
-        elif isinstance(op, Send):
-            self._exec_send(op)
-        elif isinstance(op, Recv):
-            self._exec_recv(op)
-        elif isinstance(op, Reshape):
-            self._exec_unary(op)
-        elif isinstance(op, Transpose):
-            self._exec_unary(op)
-        elif isinstance(op, FlashAttention):
-            self._exec_flash_attn(op)
-        elif isinstance(op, AllReduceAsync):
-            self._exec_collective_unary(op)
-        elif isinstance(op, (Wait, WaitAll)):
-            self._exec_sync(op)
-        elif isinstance(op, SendAsync):
-            self._exec_send_async(op)
-        elif isinstance(op, RecvAsync):
-            self._exec_recv_async(op)
-        elif isinstance(op, OverlapRegion):
-            self._exec_overlap(op)
-        elif isinstance(op, (Reinterpret, Convert)):
-            self._exec_unary(op)
-        elif isinstance(op, (Cast, LossScale)):
-            self._exec_unary(op)
-        elif isinstance(op, (FP8Quantize, FP8Dequantize, AmaxUpdate)):
-            self._exec_unary(op)
-        elif isinstance(op, ZeROGatherParam):
-            self._exec_allgather(op)
-        elif isinstance(op, ZeROScatterGrad):
-            self._exec_reducescatter(op)
-        elif isinstance(op, ZeROPartitionOptState):
-            self._exec_unary(op)
-        elif isinstance(op, RingRotate):
-            self._exec_ring_rotate(op)
-        elif isinstance(op, RingAttentionStep):
-            self._exec_flash_attn(op)
-        elif isinstance(op, RingAttention):
-            for sub in op.expand():
-                self._execute_op(sub)
-        elif isinstance(op, TopKGate):
-            self._exec_topk_gate(op)
-        elif isinstance(op, (MoEDispatch, MoECombine)):
-            self._exec_collective_unary(op)
-        elif isinstance(op, ExpertCompute):
-            self._exec_unary(op)
-        else:
-            raise ValueError(
-                f"Unknown op type: {type(op).__name__} (repr: {op}). "
-                f"inputs={op.input_names}, output={op.output_name}."
-            )
+        handler = self._find_handler(op)
+        handler(op)
 
-        # Save intermediate state snapshot
         self._save_state()
 
-    def _exec_matmul(self, op: MatMul):
-        """Execute MatMul on all devices, propagating slices."""
+    def _find_handler(self, op: IROp) -> Callable:
+        """Look up the handler for an op type in the dispatch table."""
+        for op_type, handler_name in _DISPATCH_TABLE:
+            if isinstance(op, op_type):
+                return getattr(self, handler_name)
+        raise ValueError(
+            f"Unknown op type: {type(op).__name__} (repr: {op}). "
+            f"inputs={op.input_names}, output={op.output_name}."
+        )
+
+    # ── Generic per-device handler ───────────────────────────────────────
+
+    def _exec_per_device(self, op: IROp):
+        """Generic handler: apply op independently on each device."""
+        input_names = op.input_names
         for did, dev in self.devices.items():
-            a = dev.get(op.a)
-            b = dev.get(op.b)
-            if a is None or b is None:
-                if a is None:
+            local_ctx = {}
+            missing = False
+            for name in input_names:
+                t = dev.get(name)
+                if t is None:
                     warnings.warn(
-                        f"MatMul: input '{op.a}' not found on device {did}. "
-                        f"Skipping op. Available: {list(dev.tensors.keys())}"
+                        f"{type(op).__name__}: input '{name}' not found on "
+                        f"device {did}. Skipping op. "
+                        f"Available: {list(dev.tensors.keys())}"
                     )
-                if b is None:
-                    warnings.warn(
-                        f"MatMul: input '{op.b}' not found on device {did}. "
-                        f"Skipping op. Available: {list(dev.tensors.keys())}"
-                    )
+                    missing = True
+                    break
+                local_ctx[name] = t
+            if missing:
                 continue
-            local_ctx = {op.a: a, op.b: b}
+
             result = self._apply_op(op, local_ctx)
             dev.set(result)
+            self._propagate_slice(op, dev, did, result, local_ctx)
 
-            # Propagate slices: Y = A @ B → Y rows from A, Y cols from B
-            sa = dev.get_slice(op.a)
-            sb = dev.get_slice(op.b)
-            if sa is not None and sb is not None:
-                out_global = result.global_shape
-                out_offsets = (sa.offsets[0], sb.offsets[1] if len(sb.offsets) > 1 else 0)
-                dev.set_slice(op.output, TensorSlice(
-                    device_id=did,
-                    global_shape=out_global,
-                    local_shape=result.local_shape,
-                    offsets=out_offsets,
-                ))
+    # ── Slice propagation ────────────────────────────────────────────────
 
-    def _exec_elementwise(self, op: Add | Multiply):
-        """Execute element-wise op on all devices."""
-        for did, dev in self.devices.items():
-            a = dev.get(op.a)
-            b = dev.get(op.b)
-            if a is None or b is None:
-                if a is None:
-                    warnings.warn(
-                        f"{type(op).__name__}: input '{op.a}' not found on device {did}. "
-                        f"Skipping op. Available: {list(dev.tensors.keys())}"
-                    )
-                if b is None:
-                    warnings.warn(
-                        f"{type(op).__name__}: input '{op.b}' not found on device {did}. "
-                        f"Skipping op. Available: {list(dev.tensors.keys())}"
-                    )
-                continue
-            local_ctx = {op.a: a, op.b: b}
-            result = self._apply_op(op, local_ctx)
-            dev.set(result)
-            # Element-wise: inherit slice from whichever input is sharded
-            sa = dev.get_slice(op.a)
-            sb = dev.get_slice(op.b)
-            src = sa or sb
-            if src is not None:
-                dev.set_slice(op.output, TensorSlice(
-                    device_id=did,
-                    global_shape=result.global_shape,
-                    local_shape=result.local_shape,
-                    offsets=src.offsets,
-                ))
+    def _propagate_slice(
+        self, op: IROp, dev: DeviceState, did: int,
+        result: TensorState, local_ctx: Dict[str, TensorState],
+    ):
+        """Propagate slice info based on the op's slice rule."""
+        rule = _SLICE_RULES.get(type(op), SliceRule.INHERIT_FIRST)
 
-    def _exec_unary(self, op: SiLU | Reshape | Transpose):
-        """Execute unary op on all devices."""
-        for did, dev in self.devices.items():
-            x = dev.get(op.input_names[0])
-            if x is None:
-                warnings.warn(
-                    f"{type(op).__name__}: input '{op.input_names[0]}' not found on "
-                    f"device {did}. Skipping op. Available: {list(dev.tensors.keys())}"
-                )
-                continue
-            local_ctx = {op.input_names[0]: x}
-            result = self._apply_op(op, local_ctx)
-            dev.set(result)
-            # Unary: inherit slice from input
-            sx = dev.get_slice(op.input_names[0])
-            if sx is not None:
-                dev.set_slice(op.output_name, TensorSlice(
-                    device_id=did,
-                    global_shape=result.global_shape,
-                    local_shape=result.local_shape,
-                    offsets=sx.offsets,
-                ))
+        if rule == SliceRule.NONE:
+            return
 
-    def _exec_allreduce(self, op: AllReduce):
-        """AllReduce: each device reduces its partial → replicated."""
-        for did, dev in self.devices.items():
-            x = dev.get(op.x)
-            if x is None:
-                continue
-            local_ctx = {op.x: x}
-            result = self._apply_op(op, local_ctx)
-            dev.set(result)
-            # After AllReduce, every device holds the full tensor
-            dev.set_slice(op.output, TensorSlice(
+        if rule == SliceRule.ZERO_OFFSET:
+            dev.set_slice(op.output_name, TensorSlice(
                 device_id=did,
                 global_shape=result.global_shape,
                 local_shape=result.local_shape,
                 offsets=tuple(0 for _ in result.global_shape),
             ))
+            return
 
-    def _exec_allgather(self, op: AllGather):
-        """AllGather: gather sharded dims across devices."""
-        for did, dev in self.devices.items():
-            x = dev.get(op.x)
-            if x is None:
-                continue
-            local_ctx = {op.x: x}
-            result = self._apply_op(op, local_ctx)
-            dev.set(result)
+        if rule == SliceRule.MATMUL:
+            sa = dev.get_slice(op.input_names[0])
+            sb = dev.get_slice(op.input_names[1])
+            if sa is not None and sb is not None:
+                out_offsets = (
+                    sa.offsets[0],
+                    sb.offsets[1] if len(sb.offsets) > 1 else 0,
+                )
+                dev.set_slice(op.output_name, TensorSlice(
+                    device_id=did,
+                    global_shape=result.global_shape,
+                    local_shape=result.local_shape,
+                    offsets=out_offsets,
+                ))
+            return
 
-    def _exec_reducescatter(self, op: ReduceScatter):
-        """ReduceScatter: reduce then scatter."""
-        for did, dev in self.devices.items():
-            x = dev.get(op.x)
-            if x is None:
-                continue
-            local_ctx = {op.x: x}
-            result = self._apply_op(op, local_ctx)
-            dev.set(result)
+        if rule == SliceRule.INHERIT_ANY:
+            for name in op.input_names:
+                s = dev.get_slice(name)
+                if s is not None:
+                    dev.set_slice(op.output_name, TensorSlice(
+                        device_id=did,
+                        global_shape=result.global_shape,
+                        local_shape=result.local_shape,
+                        offsets=s.offsets,
+                    ))
+                    return
+            return
+
+        # SliceRule.INHERIT_FIRST (default)
+        if op.input_names:
+            s = dev.get_slice(op.input_names[0])
+            if s is not None:
+                dev.set_slice(op.output_name, TensorSlice(
+                    device_id=did,
+                    global_shape=result.global_shape,
+                    local_shape=result.local_shape,
+                    offsets=s.offsets,
+                ))
+
+    # ── Specialized handlers ─────────────────────────────────────────────
 
     def _exec_send(self, op: Send):
         """Send tensor from src to dst device."""
@@ -415,7 +351,6 @@ class MultiDeviceExecutor:
                 f"{list(src_dev.tensors.keys())}"
             )
 
-        # Copy to dst device
         sent = copy.deepcopy(x)
         sent.name = op.output
         sent.stage = op.stage
@@ -423,17 +358,11 @@ class MultiDeviceExecutor:
         dst_dev.set(sent)
 
     def _exec_recv(self, op: Recv):
-        """Receive tensor on dst device from src.
-
-        The corresponding Send has already placed the tensor on the dst
-        device (under the Send's output name).  Recv looks for it there
-        and renames it.
-        """
+        """Receive tensor on dst device from src."""
         dst_dev = self.devices.get(op.dst)
         if dst_dev is None:
             return
 
-        # The Send already wrote the tensor to dst_dev under op.x (the Send's output)
         sent = dst_dev.get(op.x)
         if sent is None:
             raise ValueError(
@@ -447,36 +376,28 @@ class MultiDeviceExecutor:
         received.microbatch_id = op.microbatch_id
         dst_dev.set(received)
 
-    def _exec_flash_attn(self, op: FlashAttention):
-        """Execute FlashAttention on all devices (CP semantics)."""
-        for did, dev in self.devices.items():
-            q = dev.get(op.q)
-            k = dev.get(op.k)
-            v = dev.get(op.v)
-            if q is None or k is None or v is None:
-                continue
-            local_ctx = {op.q: q, op.k: k, op.v: v}
-            result = self._apply_op(op, local_ctx)
-            dev.set(result)
-            # Output inherits Q's slice
-            sq = dev.get_slice(op.q)
-            if sq is not None:
-                dev.set_slice(op.output, TensorSlice(
-                    device_id=did,
-                    global_shape=result.global_shape,
-                    local_shape=result.local_shape,
-                    offsets=sq.offsets,
-                ))
+    def _exec_send_async(self, op: SendAsync):
+        """Execute async Send: apply on src, store result on dst."""
+        src_dev = self.devices.get(op.src)
+        dst_dev = self.devices.get(op.dst)
+        if src_dev is None or dst_dev is None:
+            return
+        x = src_dev.get(op.x)
+        if x is None:
+            return
+        local_ctx = {op.x: x}
+        result = self._apply_op(op, local_ctx)
+        dst_dev.set(result)
 
-    def _exec_collective_unary(self, op):
-        """Execute a collective unary op (e.g. AllReduceAsync) on all devices."""
-        for did, dev in self.devices.items():
-            x = dev.get(op.x)
-            if x is None:
-                continue
-            local_ctx = {op.x: x}
-            result = self._apply_op(op, local_ctx)
-            dev.set(result)
+    def _exec_recv_async(self, op: RecvAsync):
+        """Execute async Recv: apply on dst device."""
+        dst_dev = self.devices.get(op.dst)
+        if dst_dev is None:
+            return
+        x = dst_dev.get(op.x)
+        local_ctx = {op.x: x} if x else {}
+        result = self._apply_op(op, local_ctx)
+        dst_dev.set(result)
 
     def _exec_sync(self, op):
         """Execute Wait/WaitAll on all devices."""
@@ -490,29 +411,6 @@ class MultiDeviceExecutor:
                     t = local_ctx.get(out_name)
                     if t is not None:
                         dev.set(t)
-
-    def _exec_send_async(self, op: SendAsync):
-        """Execute async Send."""
-        src_dev = self.devices.get(op.src)
-        dst_dev = self.devices.get(op.dst)
-        if src_dev is None or dst_dev is None:
-            return
-        x = src_dev.get(op.x)
-        if x is None:
-            return
-        local_ctx = {op.x: x}
-        result = self._apply_op(op, local_ctx)
-        dst_dev.set(result)
-
-    def _exec_recv_async(self, op: RecvAsync):
-        """Execute async Recv."""
-        dst_dev = self.devices.get(op.dst)
-        if dst_dev is None:
-            return
-        x = dst_dev.get(op.x)
-        local_ctx = {op.x: x} if x else {}
-        result = self._apply_op(op, local_ctx)
-        dst_dev.set(result)
 
     def _exec_ring_rotate(self, op: RingRotate):
         """Ring rotation: each device gets tensor from (rank-1) % ring_size."""
@@ -546,10 +444,17 @@ class MultiDeviceExecutor:
             if indices is not None:
                 dev.set(indices)
 
+    def _exec_expand(self, op):
+        """Recursively execute sub-ops from expand()."""
+        for sub in op.expand():
+            self._execute_op(sub)
+
     def _exec_overlap(self, op: OverlapRegion):
         """Execute an overlap region: run compute and comm ops."""
         for sub in op.compute_ops + op.comm_ops:
             self._execute_op(sub)
+
+    # ── State management ─────────────────────────────────────────────────
 
     def _save_state(self):
         """Save a snapshot of all device states."""
@@ -590,3 +495,63 @@ class MultiDeviceExecutor:
             tensors = list(dev.tensors.keys())
             dev_strs.append(f"  device_{did}: {tensors}")
         return f"MultiDeviceExecutor(mesh={self.mesh}):\n" + "\n".join(dev_strs)
+
+
+# ── Dispatch Table ───────────────────────────────────────────────────────────
+# Order matters: more specific types must come before their base classes.
+# Each entry is (op_type_or_tuple, handler_method_name).
+
+_DISPATCH_TABLE: List[Tuple[type, str]] = [
+    # P2P (must check before generic per_device since they have special routing)
+    (Send, "_exec_send"),
+    (Recv, "_exec_recv"),
+    (SendAsync, "_exec_send_async"),
+    (RecvAsync, "_exec_recv_async"),
+    # Sync
+    ((Wait, WaitAll), "_exec_sync"),
+    # Ring (snapshot-then-permute)
+    (RingRotate, "_exec_ring_rotate"),
+    # Expand (composite ops)
+    (RingAttention, "_exec_expand"),
+    (OverlapRegion, "_exec_overlap"),
+    # Dual-output
+    (TopKGate, "_exec_topk_gate"),
+    # Everything else: generic per-device apply
+    (MatMul, "_exec_per_device"),
+    ((Add, Multiply), "_exec_per_device"),
+    (SiLU, "_exec_per_device"),
+    (FlashAttention, "_exec_per_device"),
+    (RingAttentionStep, "_exec_per_device"),
+    (AllReduce, "_exec_per_device"),
+    (AllGather, "_exec_per_device"),
+    (ReduceScatter, "_exec_per_device"),
+    (AllReduceAsync, "_exec_per_device"),
+    ((MoEDispatch, MoECombine), "_exec_per_device"),
+    (ExpertCompute, "_exec_per_device"),
+    ((Reshape, Transpose), "_exec_per_device"),
+    ((Reinterpret, Convert), "_exec_per_device"),
+    ((Cast, LossScale), "_exec_per_device"),
+    ((FP8Quantize, FP8Dequantize, AmaxUpdate), "_exec_per_device"),
+    (ZeROGatherParam, "_exec_per_device"),
+    (ZeROScatterGrad, "_exec_per_device"),
+    (ZeROPartitionOptState, "_exec_per_device"),
+]
+
+# ── Slice Rules ──────────────────────────────────────────────────────────────
+# Maps op type -> SliceRule. Ops not listed default to INHERIT_FIRST.
+
+_SLICE_RULES: Dict[type, SliceRule] = {
+    MatMul: SliceRule.MATMUL,
+    Add: SliceRule.INHERIT_ANY,
+    Multiply: SliceRule.INHERIT_ANY,
+    AllReduce: SliceRule.ZERO_OFFSET,
+    AllGather: SliceRule.NONE,
+    ReduceScatter: SliceRule.NONE,
+    AllReduceAsync: SliceRule.NONE,
+    MoEDispatch: SliceRule.NONE,
+    MoECombine: SliceRule.NONE,
+    ZeROGatherParam: SliceRule.NONE,
+    ZeROScatterGrad: SliceRule.NONE,
+    ZeROPartitionOptState: SliceRule.NONE,
+    AmaxUpdate: SliceRule.NONE,
+}
