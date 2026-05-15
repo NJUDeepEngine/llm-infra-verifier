@@ -159,6 +159,8 @@ Every forward collective has a backward dual:
 | ZeROGatherParam(dim) | ZeROScatterGrad(dim) | Same dim |
 | RingRotate(size) | RingRotate(size) | Self-dual, same ring_size |
 | MoEDispatch(s,c) | MoECombine(c,s) | Dims swapped |
+| FP8Quantize(src→dst) | FP8Dequantize(dst→src) | Reversed dtype + scale |
+| FP8Dequantize(src→dst) | FP8Quantize(dst→src) | Reversed dtype + scale |
 
 `_is_dual(fwd, bwd)` checks structural match. `_generate_dual_collective(entry, grads)` produces the backward op.
 
@@ -166,6 +168,18 @@ Every forward collective has a backward dual:
 
 Cast VJP reverses dtype: `Cast(fp32→fp16)` backward is `Cast(fp16→fp32)`.
 LossScale VJP reverses direction: `scale` → `unscale`.
+FP8Quantize VJP dequantizes: `FP8Quantize(fp32→fp8e4m3)` backward is dequantize (fp8→fp32), clears `fp8_scale_expr`.
+FP8Dequantize VJP quantizes: `FP8Dequantize(fp8e4m3→fp32)` backward is quantize (fp32→fp8), attaches `fp8_scale_expr`.
+AmaxUpdate VJP is empty (observation-only, not differentiable).
+
+### 4.4 FP8 Conventions
+
+- Forward activations/weights: `fp8e4m3` (higher precision, 4 exponent + 3 mantissa bits)
+- Backward gradients: `fp8e5m2` (wider dynamic range, 5 exponent + 2 mantissa bits)
+- `DtypeGuard.check_fp8_format_usage(tensor, phase)` enforces this convention
+- Per-tensor scale is symbolic (`scale_expr: str`), tracked on `TensorState.fp8_scale_expr`
+- Delayed scaling: `AmaxUpdate` at iter N must happen-before `FP8Quantize` at iter N+1
+- `DtypeGuard.check_fp8_scale_freshness(quantize_idx, amax_idx)` verifies ordering
 
 ---
 
@@ -180,6 +194,7 @@ In `executor.py._execute_op()`, add an isinstance branch. Prefer reusing existin
 | ZeROGatherParam | `_exec_allgather` | Same gather semantics |
 | ZeROScatterGrad | `_exec_reducescatter` | Same scatter semantics |
 | Cast, LossScale, ExpertCompute, ZeROPartitionOptState | `_exec_unary` | Shape/device-independent |
+| FP8Quantize, FP8Dequantize, AmaxUpdate | `_exec_unary` | Shape/device-independent |
 | MoEDispatch, MoECombine | `_exec_collective_unary` | Standard collective |
 | RingAttentionStep | `_exec_flash_attn` | Same QKV→output pattern |
 
