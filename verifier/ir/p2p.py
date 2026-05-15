@@ -40,6 +40,7 @@ class Send(IROp):
             global_shape=x.global_shape,
             local_shape=x.local_shape,
             sharding=x.sharding,
+            dtype=x.dtype,
             expr=x.expr,
             requires_grad=x.requires_grad,
             grad_name=f"grad_{self.output}",
@@ -61,6 +62,7 @@ class Send(IROp):
             global_shape=x.global_shape,
             local_shape=x.local_shape,
             sharding=x.sharding,
+            dtype=x.dtype,
             expr=f"Recv(grad({x.expr}), src={self.dst})" if x.expr else "",
             stage=self.src,
             microbatch_id=self.microbatch_id,
@@ -125,6 +127,7 @@ class Recv(IROp):
             global_shape=x.global_shape,
             local_shape=x.local_shape,
             sharding=x.sharding,
+            dtype=x.dtype,
             expr=x.expr,
             requires_grad=x.requires_grad,
             grad_name=f"grad_{self.output}",
@@ -146,6 +149,7 @@ class Recv(IROp):
             global_shape=x.global_shape,
             local_shape=x.local_shape,
             sharding=x.sharding,
+            dtype=x.dtype,
             expr=f"Send(grad({x.expr}), dst={self.src})" if x.expr else "",
             stage=self.dst,
             microbatch_id=self.microbatch_id,
@@ -200,6 +204,7 @@ class SendAsync(IROp):
         result = TensorState(
             name=self.output, global_shape=x.global_shape,
             local_shape=x.local_shape, sharding=x.sharding,
+            dtype=x.dtype,
             expr=x.expr, stage=self.dst, microbatch_id=self.microbatch_id,
             _async_handle=self.handle,
         )
@@ -207,10 +212,12 @@ class SendAsync(IROp):
         return result
 
     def vjp(self, ctx, grad_output):
+        x = ctx[self.x]
         return {self.x: TensorState(
-            name=f"grad_{self.x}", global_shape=ctx[self.x].global_shape,
-            local_shape=ctx[self.x].local_shape,
-            sharding=ctx[self.x].sharding,
+            name=f"grad_{self.x}", global_shape=x.global_shape,
+            local_shape=x.local_shape,
+            sharding=x.sharding,
+            dtype=x.dtype,
         )}
     def is_collective(self): return True
     def is_p2p(self): return True
@@ -249,6 +256,7 @@ class RecvAsync(IROp):
             name=self.output, global_shape=x.global_shape if x else (),
             local_shape=x.local_shape if x else (),
             sharding=x.sharding if x else None,
+            dtype=x.dtype if x else None,
             stage=self.dst, microbatch_id=self.microbatch_id,
             _async_handle=self.handle,
         )
@@ -256,7 +264,12 @@ class RecvAsync(IROp):
         return result
 
     def vjp(self, ctx, grad_output):
-        return {self.x: TensorState(name=f"grad_{self.x}")}
+        x = ctx[self.x]
+        return {self.x: TensorState(
+            name=f"grad_{self.x}", global_shape=x.global_shape,
+            local_shape=x.local_shape, sharding=x.sharding,
+            dtype=x.dtype,
+        )}
     def is_collective(self): return True
     def is_p2p(self): return True
     def is_async(self): return True

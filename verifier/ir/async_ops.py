@@ -90,6 +90,7 @@ class AllReduceAsync(IROp):
         result = TensorState(
             name=self.output, global_shape=x.global_shape,
             local_shape=x.global_shape, sharding=out_spec,
+            dtype=x.dtype,
             expr=x.expr, requires_grad=x.requires_grad,
             grad_name=f"grad_{self.output}",
             _async_handle=self.handle,
@@ -102,6 +103,7 @@ class AllReduceAsync(IROp):
         return {self.x: TensorState(
             name=f"grad_{self.x}", global_shape=x.global_shape,
             local_shape=x.local_shape, sharding=x.sharding,
+            dtype=x.dtype,
         )}
 
     def is_collective(self) -> bool:
@@ -148,6 +150,7 @@ class Wait(IROp):
         result = TensorState(
             name=self.output, global_shape=ts.global_shape,
             local_shape=ts.local_shape, sharding=ts.sharding,
+            dtype=ts.dtype,
             expr=ts.expr, requires_grad=ts.requires_grad,
             grad_name=ts.grad_name,
             _async_handle=None,
@@ -200,6 +203,7 @@ class WaitAll(IROp):
             result = TensorState(
                 name=output, global_shape=ts.global_shape,
                 local_shape=ts.local_shape, sharding=ts.sharding,
+                dtype=ts.dtype,
                 expr=ts.expr, requires_grad=ts.requires_grad,
                 _async_handle=None,
             )

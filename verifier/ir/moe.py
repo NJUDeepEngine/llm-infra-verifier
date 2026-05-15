@@ -78,6 +78,7 @@ class TopKGate(IROp):
             global_shape=x.global_shape,
             local_shape=x.local_shape,
             sharding=x.sharding,
+            dtype=x.dtype,
             expr=f"topk_gate_grad({x.expr})" if x.expr else "",
         )
         return {self.x: grad}
@@ -235,6 +236,7 @@ class ExpertCompute(IROp):
             global_shape=x.global_shape,
             local_shape=x.local_shape,
             sharding=x.sharding,
+            dtype=x.dtype,
             expr=f"expert{self.expert_id}_grad({x.expr})" if x.expr else "",
         )
         return {self.x: grad}

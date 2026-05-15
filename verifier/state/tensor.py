@@ -168,6 +168,7 @@ class TensorState:
             grad_name="",
             _async_handle=None,
             is_activation=False,
+            fp8_scale_expr=None,
         )
 
     def __hash__(self):
@@ -188,8 +189,10 @@ class TensorState:
         partial_str = " PARTIAL" if self.partial else ""
         stage_str = f" stage={self.stage}" if self.stage is not None else ""
         mb_str = f" mb={self.microbatch_id}" if self.microbatch_id is not None else ""
+        dtype_str = f" dtype={self.dtype}" if self.dtype else ""
+        fp8_str = f" scale={self.fp8_scale_expr}" if self.fp8_scale_expr else ""
         return (
             f"TensorState({self.name}, shape={self.global_shape}"
             f"→{self.local_shape}, [{placement_str}]{partial_str}"
-            f"{stage_str}{mb_str})"
+            f"{dtype_str}{fp8_str}{stage_str}{mb_str})"
         )
