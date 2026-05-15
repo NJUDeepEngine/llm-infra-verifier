@@ -65,6 +65,7 @@ class RingRotate(IROp):
             global_shape=x.global_shape,
             local_shape=x.local_shape,
             sharding=x.sharding,
+            dtype=x.dtype,
             expr=f"RingRotateReverse(grad({x.expr}))" if x.expr else "",
         )
         return {self.x: grad}
@@ -136,6 +137,7 @@ class RingAttentionStep(IROp):
             global_shape=out_global,
             local_shape=out_local,
             sharding=out_spec,
+            dtype=q.dtype,
             expr=f"ring_attn_step{self.ring_step}({q.expr}, {k.expr}, {v.expr})" if q.expr else "",
             requires_grad=q.requires_grad or k.requires_grad or v.requires_grad,
             grad_name=f"grad_{self.output}",
@@ -155,6 +157,7 @@ class RingAttentionStep(IROp):
                 global_shape=ts.global_shape,
                 local_shape=ts.local_shape,
                 sharding=ts.sharding,
+                dtype=ts.dtype,
                 expr=expr_fn(ts.expr) if ts.expr else "",
                 ring_step=self.ring_step,
             )
@@ -232,6 +235,7 @@ class RingAttention(IROp):
             global_shape=out_global,
             local_shape=out_local,
             sharding=out_spec,
+            dtype=q.dtype,
             expr=f"ring_attn({q.expr})" if q.expr else "",
             requires_grad=q.requires_grad,
             grad_name=f"grad_{self.output}",
@@ -281,6 +285,7 @@ class RingAttention(IROp):
             global_shape=q.global_shape,
             local_shape=q.local_shape,
             sharding=q.sharding,
+            dtype=q.dtype,
             expr=f"ring_attn_grad_q({q.expr})" if q.expr else "",
         )
         grad_k = TensorState(
@@ -288,6 +293,7 @@ class RingAttention(IROp):
             global_shape=k.global_shape,
             local_shape=k.local_shape,
             sharding=k.sharding,
+            dtype=k.dtype,
             expr=f"ring_attn_grad_k({k.expr})" if k.expr else "",
         )
         grad_v = TensorState(
@@ -295,6 +301,7 @@ class RingAttention(IROp):
             global_shape=v.global_shape,
             local_shape=v.local_shape,
             sharding=v.sharding,
+            dtype=v.dtype,
             expr=f"ring_attn_grad_v({v.expr})" if v.expr else "",
         )
         return {self.q: grad_q, self.k: grad_k, self.v: grad_v}

@@ -437,7 +437,8 @@ class AutogradEngine:
 
         # Ring
         if isinstance(fwd_op, RingRotate) and isinstance(bwd_op, RingRotate):
-            return fwd_op.ring_size == bwd_op.ring_size
+            return (fwd_op.ring_size == bwd_op.ring_size and
+                    fwd_op.ring_dim == bwd_op.ring_dim)
 
         # MoE
         if isinstance(fwd_op, MoEDispatch) and isinstance(bwd_op, MoECombine):

@@ -118,6 +118,7 @@ class ElementWiseBinaryOp(IROp):
             global_shape=a.global_shape,
             local_shape=out_local,
             sharding=out_spec,
+            dtype=a.dtype,
             expr=expr,
             requires_grad=a.requires_grad or b.requires_grad,
             grad_name=f"grad_{self.output}",
@@ -199,6 +200,7 @@ class MatMul(IROp):
             global_shape=out_global,
             local_shape=out_local,
             sharding=out_spec,
+            dtype=a.dtype,
             expr=expr,
             requires_grad=a.requires_grad or b.requires_grad,
             grad_name=f"grad_{self.output}",
@@ -219,6 +221,7 @@ class MatMul(IROp):
             global_shape=a.global_shape,
             local_shape=a.local_shape,
             sharding=a.sharding,
+            dtype=a.dtype,
             expr=f"grad({a.expr})" if a.expr else "",
             requires_grad=False,
         )
@@ -227,6 +230,7 @@ class MatMul(IROp):
             global_shape=b.global_shape,
             local_shape=b.local_shape,
             sharding=b.sharding,
+            dtype=b.dtype,
             expr=f"grad({b.expr})" if b.expr else "",
             requires_grad=False,
         )
@@ -302,6 +306,7 @@ class Multiply(ElementWiseBinaryOp):
             global_shape=a.global_shape,
             local_shape=a.local_shape,
             sharding=a.sharding,
+            dtype=a.dtype,
             expr=f"grad({a.expr}) * {b.expr}" if a.expr and b.expr else "",
         )
         grad_b = TensorState(
@@ -309,6 +314,7 @@ class Multiply(ElementWiseBinaryOp):
             global_shape=b.global_shape,
             local_shape=b.local_shape,
             sharding=b.sharding,
+            dtype=b.dtype,
             expr=f"grad({self.output}) * {a.expr}" if a.expr and b.expr else "",
         )
         return {self.a: grad_a, self.b: grad_b}
@@ -348,6 +354,7 @@ class SiLU(IROp):
             global_shape=x.global_shape,
             local_shape=x.local_shape,
             sharding=x.sharding,
+            dtype=x.dtype,
             expr=f"silu({x.expr})" if x.expr else "",
             requires_grad=x.requires_grad,
             grad_name=f"grad_{self.output}",
@@ -366,6 +373,7 @@ class SiLU(IROp):
             global_shape=x.global_shape,
             local_shape=x.local_shape,
             sharding=x.sharding,
+            dtype=x.dtype,
             expr=f"silu_grad({x.expr})",
         )
         return {self.x: grad_x}
@@ -438,6 +446,7 @@ class FlashAttention(IROp):
             global_shape=out_global,
             local_shape=out_local,
             sharding=out_spec,
+            dtype=q.dtype,
             expr=f"attn({q.expr}, {k.expr}, {v.expr})" if q.expr else "",
             requires_grad=q.requires_grad or k.requires_grad or v.requires_grad,
             grad_name=f"grad_{self.output}",
@@ -459,6 +468,7 @@ class FlashAttention(IROp):
             global_shape=q.global_shape,
             local_shape=q.local_shape,
             sharding=q.sharding,
+            dtype=q.dtype,
             expr=f"attn_grad_q({q.expr})",
         )
         grad_k = TensorState(
@@ -466,6 +476,7 @@ class FlashAttention(IROp):
             global_shape=k.global_shape,
             local_shape=k.local_shape,
             sharding=k.sharding,
+            dtype=k.dtype,
             expr=f"attn_grad_k({k.expr})",
         )
         grad_v = TensorState(
@@ -473,6 +484,7 @@ class FlashAttention(IROp):
             global_shape=v.global_shape,
             local_shape=v.local_shape,
             sharding=v.sharding,
+            dtype=v.dtype,
             expr=f"attn_grad_v({v.expr})",
         )
         return {self.q: grad_q, self.k: grad_k, self.v: grad_v}

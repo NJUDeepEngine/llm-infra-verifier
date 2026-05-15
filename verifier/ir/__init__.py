@@ -63,6 +63,9 @@ from .precision import (
     Cast,
     LossScale,
     DtypeGuard,
+    FP8Quantize,
+    FP8Dequantize,
+    AmaxUpdate,
 )
 
 from .zero import (
@@ -107,7 +110,7 @@ __all__ = [
     # spmd
     "Reinterpret", "Convert", "SPMDGuard",
     # precision
-    "Cast", "LossScale", "DtypeGuard",
+    "Cast", "LossScale", "DtypeGuard", "FP8Quantize", "FP8Dequantize", "AmaxUpdate",
     # zero
     "ZeROGatherParam", "ZeROScatterGrad", "ZeROPartitionOptState",
     # cp

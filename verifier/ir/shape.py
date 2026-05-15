@@ -37,6 +37,7 @@ class Reshape(IROp):
             global_shape=self.new_shape,
             local_shape=compute_local_shape(self.new_shape, x.sharding),
             sharding=x.sharding,
+            dtype=x.dtype,
             expr=f"reshape({x.expr})" if x.expr else "",
             requires_grad=x.requires_grad,
             grad_name=f"grad_{self.output}",
@@ -55,6 +56,7 @@ class Reshape(IROp):
             global_shape=x.global_shape,
             local_shape=x.local_shape,
             sharding=x.sharding,
+            dtype=x.dtype,
             expr=f"reshape_inv(grad({x.expr}))" if x.expr else "",
         )
         return {self.x: grad_x}
@@ -120,6 +122,7 @@ class Transpose(IROp):
             global_shape=tuple(new_global),
             local_shape=tuple(new_local),
             sharding=out_spec,
+            dtype=x.dtype,
             expr=f"transpose({x.expr})" if x.expr else "",
             requires_grad=x.requires_grad,
             grad_name=f"grad_{self.output}",
@@ -138,6 +141,7 @@ class Transpose(IROp):
             global_shape=x.global_shape,
             local_shape=x.local_shape,
             sharding=x.sharding,
+            dtype=x.dtype,
             expr=f"transpose(grad({x.expr}))" if x.expr else "",
         )
         return {self.x: grad_x}

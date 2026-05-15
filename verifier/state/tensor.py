@@ -72,6 +72,8 @@ class TensorState:
     zero_stage: Optional[int] = None
     param_group: Optional[str] = None
 
+    fp8_scale_expr: Optional[str] = None
+
     expert_id: Optional[int] = None
     num_experts: Optional[int] = None
     expert_capacity: Optional[int] = None
@@ -110,8 +112,23 @@ class TensorState:
     def is_fp32(self) -> bool:
         return self.dtype in ("fp32", None)
 
+    @property
+    def is_fp8(self) -> bool:
+        return self.dtype in ("fp8e4m3", "fp8e5m2")
+
+    @property
+    def is_fp8e4m3(self) -> bool:
+        return self.dtype == "fp8e4m3"
+
+    @property
+    def is_fp8e5m2(self) -> bool:
+        return self.dtype == "fp8e5m2"
+
     def with_dtype(self, dtype: str) -> TensorState:
         return replace(self, dtype=dtype)
+
+    def with_fp8_scale(self, scale_expr: Optional[str]) -> TensorState:
+        return replace(self, fp8_scale_expr=scale_expr)
 
     @property
     def gradient_type(self) -> LocalSPMDType:

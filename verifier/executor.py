@@ -50,6 +50,9 @@ from .ir import (
     Convert,
     Cast,
     LossScale,
+    FP8Quantize,
+    FP8Dequantize,
+    AmaxUpdate,
     ZeROGatherParam,
     ZeROScatterGrad,
     ZeROPartitionOptState,
@@ -240,6 +243,8 @@ class MultiDeviceExecutor:
         elif isinstance(op, (Reinterpret, Convert)):
             self._exec_unary(op)
         elif isinstance(op, (Cast, LossScale)):
+            self._exec_unary(op)
+        elif isinstance(op, (FP8Quantize, FP8Dequantize, AmaxUpdate)):
             self._exec_unary(op)
         elif isinstance(op, ZeROGatherParam):
             self._exec_allgather(op)

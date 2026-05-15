@@ -504,3 +504,45 @@ class TestMoEAutograd:
         assert isinstance(bwd_ops[0], MoECombine)
         assert bwd_ops[0].split_dim == 1  # reversed
         assert bwd_ops[0].concat_dim == 0
+
+
+# ── dtype preservation ────────────────────────────────────────────────────
+
+
+class TestMoEDtypePreservation:
+    """Regression: MoE collectives must propagate dtype from input."""
+
+    def test_dispatch_preserves_dtype(self):
+        spec = _shard_spec(dim=0)
+        t = _make_tensor("tok", spec=spec)
+        t.dtype = "fp16"
+        ctx = {"tok": t}
+        op = MoEDispatch(
+            x="tok", output="disp", num_experts=4, split_dim=0, concat_dim=1,
+        )
+        result = op.apply(ctx)
+        assert result.dtype == "fp16"
+
+    def test_combine_preserves_dtype(self):
+        spec = _shard_spec(dim=1)
+        t = _make_tensor("expert_out", spec=spec)
+        t.dtype = "bf16"
+        ctx = {"expert_out": t}
+        op = MoECombine(
+            x="expert_out", output="combined",
+            num_experts=4, split_dim=1, concat_dim=0,
+        )
+        result = op.apply(ctx)
+        assert result.dtype == "bf16"
+
+    def test_dispatch_vjp_preserves_dtype(self):
+        spec = _shard_spec(dim=0)
+        t = _make_tensor("tok", spec=spec, expr="tok")
+        t.dtype = "fp16"
+        ctx = {"tok": t}
+        op = MoEDispatch(
+            x="tok", output="disp", num_experts=4, split_dim=0, concat_dim=1,
+        )
+        grad_out = _make_tensor("grad_disp", spec=spec)
+        grads = op.vjp(ctx, grad_out)
+        assert grads["tok"].dtype == "fp16"

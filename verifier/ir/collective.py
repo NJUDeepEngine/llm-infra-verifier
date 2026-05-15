@@ -63,6 +63,7 @@ class CollectiveOp(IROp):
             global_shape=x.global_shape,
             local_shape=out_local,
             sharding=out_spec,
+            dtype=x.dtype,
             expr=x.expr,
             requires_grad=x.requires_grad,
             grad_name=f"grad_{self.output}",
@@ -81,6 +82,7 @@ class CollectiveOp(IROp):
             global_shape=x.global_shape,
             local_shape=x.local_shape,
             sharding=x.sharding,
+            dtype=x.dtype,
             expr=expr,
         )
 
@@ -205,6 +207,7 @@ class ReduceScatter(CollectiveOp):
             global_shape=x.global_shape,
             local_shape=compute_local_shape(x.global_shape, grad_spec),
             sharding=grad_spec,
+            dtype=x.dtype,
             expr=f"AllGather(grad({x.expr}), dim={self.scatter_dim})" if x.expr else "",
         )
         return {self.x: grad_x}

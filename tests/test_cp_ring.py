@@ -440,3 +440,49 @@ class TestCPRingAutograd:
         assert len(bwd_ops) == 1
         assert isinstance(bwd_ops[0], RingRotate)
         assert bwd_ops[0].ring_size == 4
+
+    def test_ring_rotate_dim_mismatch_not_dual(self):
+        """ring_dim differs → not dual, even if ring_size matches."""
+        engine = AutogradEngine()
+        assert not engine._is_dual(
+            RingRotate(x="k", output="kr", ring_size=4, ring_dim=0),
+            RingRotate(x="gk", output="gkr", ring_size=4, ring_dim=1),
+        )
+
+
+# ── dtype preservation ────────────────────────────────────────────────────
+
+
+class TestCPRingDtypePreservation:
+    """Regression: Ring ops must propagate dtype from input."""
+
+    def test_ring_attention_step_preserves_dtype(self):
+        mesh = _mesh()
+        rep = _rep_spec(mesh)
+        q = _make_tensor("q", spec=rep)
+        k = _make_tensor("k", spec=rep)
+        v = _make_tensor("v", spec=rep)
+        q.dtype = "bf16"
+        k.dtype = "bf16"
+        v.dtype = "bf16"
+        ctx = {"q": q, "k": k, "v": v}
+        op = RingAttentionStep(
+            q="q", k="k", v="v", output="out",
+            ring_step=0, ring_size=4,
+        )
+        result = op.apply(ctx)
+        assert result.dtype == "bf16"
+
+    def test_ring_attention_preserves_dtype(self):
+        mesh = _mesh()
+        rep = _rep_spec(mesh)
+        q = _make_tensor("q", spec=rep)
+        k = _make_tensor("k", spec=rep)
+        v = _make_tensor("v", spec=rep)
+        q.dtype = "fp16"
+        k.dtype = "fp16"
+        v.dtype = "fp16"
+        ctx = {"q": q, "k": k, "v": v}
+        op = RingAttention(q="q", k="k", v="v", output="out", ring_size=4)
+        result = op.apply(ctx)
+        assert result.dtype == "fp16"

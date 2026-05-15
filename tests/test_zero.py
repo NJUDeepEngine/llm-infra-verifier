@@ -364,3 +364,35 @@ class TestZeROAutograd:
         assert len(bwd_ops) == 1
         assert isinstance(bwd_ops[0], ZeROScatterGrad)
         assert bwd_ops[0].scatter_dim == 0
+
+
+# ── dtype preservation ────────────────────────────────────────────────────
+
+
+class TestZeRODtypePreservation:
+    """Regression: ZeRO collectives must propagate dtype from input."""
+
+    def test_gather_preserves_dtype(self):
+        spec = _shard_spec(dim=0)
+        t = _make_tensor("w", dtype="fp16", spec=spec)
+        ctx = {"w": t}
+        op = ZeROGatherParam(x="w", output="wf", gather_dim=0)
+        result = op.apply(ctx)
+        assert result.dtype == "fp16"
+
+    def test_scatter_preserves_dtype(self):
+        spec = _rep_spec()
+        t = _make_tensor("g", dtype="bf16", spec=spec)
+        ctx = {"g": t}
+        op = ZeROScatterGrad(x="g", output="gs", scatter_dim=0)
+        result = op.apply(ctx)
+        assert result.dtype == "bf16"
+
+    def test_gather_vjp_preserves_dtype(self):
+        spec = _shard_spec(dim=0)
+        t = _make_tensor("w", dtype="fp16", spec=spec, expr="w")
+        ctx = {"w": t}
+        op = ZeROGatherParam(x="w", output="wf", gather_dim=0)
+        grad_out = _make_tensor("gy", dtype="fp16")
+        grads = op.vjp(ctx, grad_out)
+        assert grads["w"].dtype == "fp16"

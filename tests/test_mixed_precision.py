@@ -18,7 +18,12 @@ from verifier.ir import (
     DtypeGuard,
     MatMul,
     AllReduce,
+    AllGather,
+    ReduceScatter,
     Program,
+    FP8Quantize,
+    FP8Dequantize,
+    AmaxUpdate,
 )
 from verifier.executor import MultiDeviceExecutor
 
@@ -414,3 +419,463 @@ class TestMixedPrecisionExecutor:
         assert result.dtype == "fp16"
         assert result.sharding.placements == (Shard(dim=1), Replicate())
         assert result.local_shape == t.local_shape
+
+
+# ── dtype preservation through collectives ────────────────────────────────
+
+
+class TestDtypePreservation:
+    """Regression: CollectiveOp.apply() must propagate dtype from input."""
+
+    def test_allgather_preserves_dtype(self):
+        spec = _shard_spec(dim=0)
+        t = _make_tensor("x", dtype="fp16", spec=spec)
+        ctx = {"x": t}
+        op = AllGather(x="x", output="y", gather_dim=0)
+        result = op.apply(ctx)
+        assert result.dtype == "fp16"
+
+    def test_reducescatter_preserves_dtype(self):
+        spec = _rep_spec()
+        t = _make_tensor("x", dtype="bf16", spec=spec)
+        ctx = {"x": t}
+        op = ReduceScatter(x="x", output="y", scatter_dim=0)
+        result = op.apply(ctx)
+        assert result.dtype == "bf16"
+
+    def test_allgather_vjp_preserves_dtype(self):
+        spec = _shard_spec(dim=0)
+        t = _make_tensor("x", dtype="fp16", spec=spec, expr="x")
+        ctx = {"x": t}
+        op = AllGather(x="x", output="y", gather_dim=0)
+        grad_out = _make_tensor("gy", dtype="fp16")
+        grads = op.vjp(ctx, grad_out)
+        assert grads["x"].dtype == "fp16"
+
+    def test_cast_then_allreduce_preserves_fp16(self):
+        """Cast(fp32->fp16) -> AllReduce -> output must be fp16."""
+        mesh = _mesh2()
+        spec = _partial_spec(mesh)
+        t = _make_tensor("x", dtype="fp16", spec=spec)
+        ctx = {"x": t}
+        op = AllReduce(x="x", output="y")
+        result = op.apply(ctx)
+        assert result.dtype == "fp16"
+
+
+# ── FP8 TensorState Properties ───────────────────────────────────────────────
+
+
+class TestTensorStateFP8:
+    def test_fp8e4m3_properties(self):
+        t = _make_tensor("x", dtype="fp8e4m3")
+        assert t.is_fp8e4m3
+        assert t.is_fp8
+        assert not t.is_fp8e5m2
+        assert not t.is_fp16
+        assert not t.is_fp32
+
+    def test_fp8e5m2_properties(self):
+        t = _make_tensor("x", dtype="fp8e5m2")
+        assert t.is_fp8e5m2
+        assert t.is_fp8
+        assert not t.is_fp8e4m3
+        assert not t.is_bf16
+        assert not t.is_fp32
+
+    def test_is_fp8_covers_both(self):
+        assert _make_tensor("a", dtype="fp8e4m3").is_fp8
+        assert _make_tensor("b", dtype="fp8e5m2").is_fp8
+        assert not _make_tensor("c", dtype="fp16").is_fp8
+        assert not _make_tensor("d", dtype=None).is_fp8
+
+    def test_fp8_scale_expr_field(self):
+        t = _make_tensor("x", dtype="fp8e4m3")
+        assert t.fp8_scale_expr is None
+        t2 = t.with_fp8_scale("scale_x")
+        assert t2.fp8_scale_expr == "scale_x"
+        assert t.fp8_scale_expr is None
+
+    def test_with_fp8_scale_none_clears(self):
+        t = _make_tensor("x", dtype="fp8e4m3")
+        t2 = t.with_fp8_scale("scale_x")
+        t3 = t2.with_fp8_scale(None)
+        assert t3.fp8_scale_expr is None
+
+
+# ── FP8Quantize ──────────────────────────────────────────────────────────────
+
+
+class TestFP8Quantize:
+    def test_quantize_fp32_to_e4m3(self):
+        t = _make_tensor("x", dtype="fp32", expr="x")
+        ctx = {"x": t}
+        op = FP8Quantize(x="x", output="x_q", scale_expr="scale_x",
+                         src_dtype="fp32", dst_dtype="fp8e4m3")
+        result = op.apply(ctx)
+        assert result.dtype == "fp8e4m3"
+        assert result.name == "x_q"
+        assert result.fp8_scale_expr == "scale_x"
+        assert "fp8_quantize" in result.expr
+
+    def test_quantize_bf16_to_e5m2(self):
+        t = _make_tensor("x", dtype="bf16", expr="x")
+        ctx = {"x": t}
+        op = FP8Quantize(x="x", output="x_q", scale_expr="scale_g",
+                         src_dtype="bf16", dst_dtype="fp8e5m2")
+        result = op.apply(ctx)
+        assert result.dtype == "fp8e5m2"
+        assert result.fp8_scale_expr == "scale_g"
+
+    def test_quantize_preserves_sharding(self):
+        spec = _shard_spec(dim=1)
+        t = _make_tensor("x", shape=(8, 16), spec=spec, dtype="fp32")
+        ctx = {"x": t}
+        op = FP8Quantize(x="x", output="y", scale_expr="s",
+                         src_dtype="fp32", dst_dtype="fp8e4m3")
+        result = op.apply(ctx)
+        assert result.sharding.placements == spec.placements
+        assert result.global_shape == (8, 16)
+
+    def test_quantize_dtype_mismatch_raises(self):
+        t = _make_tensor("x", dtype="bf16")
+        ctx = {"x": t}
+        op = FP8Quantize(x="x", output="y", scale_expr="s",
+                         src_dtype="fp32", dst_dtype="fp8e4m3")
+        with pytest.raises(ValueError, match="expected src_dtype"):
+            op.apply(ctx)
+
+    def test_quantize_invalid_dst_dtype_raises(self):
+        with pytest.raises(ValueError, match="fp8e4m3.*fp8e5m2"):
+            FP8Quantize(x="x", output="y", scale_expr="s",
+                        src_dtype="fp32", dst_dtype="fp16")
+
+    def test_quantize_none_dtype_accepted(self):
+        t = _make_tensor("x", dtype=None, expr="x")
+        ctx = {"x": t}
+        op = FP8Quantize(x="x", output="y", scale_expr="s",
+                         src_dtype="fp32", dst_dtype="fp8e4m3")
+        result = op.apply(ctx)
+        assert result.dtype == "fp8e4m3"
+
+    def test_quantize_vjp_dequantizes(self):
+        t = _make_tensor("x", dtype="fp32", expr="x")
+        ctx = {"x": t}
+        op = FP8Quantize(x="x", output="y", scale_expr="s",
+                         src_dtype="fp32", dst_dtype="fp8e4m3")
+        result = op.apply(ctx)
+        grads = op.vjp(ctx, result)
+        grad_x = grads["x"]
+        assert grad_x.dtype == "fp32"
+        assert grad_x.fp8_scale_expr is None
+        _assert_grad_matches_fwd(grad_x, t)
+
+    def test_quantize_clone_with_names(self):
+        op = FP8Quantize(x="x", output="y", scale_expr="s",
+                         src_dtype="fp32", dst_dtype="fp8e4m3")
+        cloned = op.clone_with_names({"x": "a"}, "b")
+        assert cloned.x == "a"
+        assert cloned.output == "b"
+        assert cloned.scale_expr == "s"
+        assert cloned.dst_dtype == "fp8e4m3"
+
+    def test_quantize_spmd_passthrough(self):
+        op = FP8Quantize(x="x", output="y", scale_expr="s",
+                         src_dtype="fp32", dst_dtype="fp8e4m3")
+        assert op.propagate_spmd_type({"x": LocalSPMDType.VARYING}) == LocalSPMDType.VARYING
+
+    def test_quantize_not_collective(self):
+        op = FP8Quantize(x="x", output="y", scale_expr="s",
+                         src_dtype="fp32", dst_dtype="fp8e4m3")
+        assert not op.is_collective()
+
+
+# ── FP8Dequantize ────────────────────────────────────────────────────────────
+
+
+class TestFP8Dequantize:
+    def test_dequantize_e4m3_to_fp32(self):
+        t = _make_tensor("x", dtype="fp8e4m3", expr="x")
+        t = t.with_fp8_scale("scale_x")
+        ctx = {"x": t}
+        op = FP8Dequantize(x="x", output="y", scale_expr="scale_x",
+                           src_dtype="fp8e4m3", dst_dtype="fp32")
+        result = op.apply(ctx)
+        assert result.dtype == "fp32"
+        assert result.fp8_scale_expr is None
+        assert "fp8_dequantize" in result.expr
+
+    def test_dequantize_e5m2_to_bf16(self):
+        t = _make_tensor("x", dtype="fp8e5m2", expr="x")
+        ctx = {"x": t}
+        op = FP8Dequantize(x="x", output="y", scale_expr="s",
+                           src_dtype="fp8e5m2", dst_dtype="bf16")
+        result = op.apply(ctx)
+        assert result.dtype == "bf16"
+
+    def test_dequantize_preserves_sharding(self):
+        spec = _shard_spec(dim=0)
+        t = _make_tensor("x", shape=(8, 16), spec=spec, dtype="fp8e4m3")
+        ctx = {"x": t}
+        op = FP8Dequantize(x="x", output="y", scale_expr="s",
+                           src_dtype="fp8e4m3", dst_dtype="fp32")
+        result = op.apply(ctx)
+        assert result.sharding.placements == spec.placements
+        assert result.global_shape == (8, 16)
+
+    def test_dequantize_dtype_mismatch_raises(self):
+        t = _make_tensor("x", dtype="fp16")
+        ctx = {"x": t}
+        op = FP8Dequantize(x="x", output="y", scale_expr="s",
+                           src_dtype="fp8e4m3", dst_dtype="fp32")
+        with pytest.raises(ValueError, match="expected src_dtype"):
+            op.apply(ctx)
+
+    def test_dequantize_invalid_src_dtype_raises(self):
+        with pytest.raises(ValueError, match="fp8e4m3.*fp8e5m2"):
+            FP8Dequantize(x="x", output="y", scale_expr="s",
+                          src_dtype="fp32", dst_dtype="fp16")
+
+    def test_dequantize_vjp_quantizes(self):
+        t = _make_tensor("x", dtype="fp8e4m3", expr="x")
+        ctx = {"x": t}
+        op = FP8Dequantize(x="x", output="y", scale_expr="s",
+                           src_dtype="fp8e4m3", dst_dtype="fp32")
+        result = op.apply(ctx)
+        grads = op.vjp(ctx, result)
+        grad_x = grads["x"]
+        assert grad_x.dtype == "fp8e4m3"
+        assert grad_x.fp8_scale_expr == "s"
+        _assert_grad_matches_fwd(grad_x, t)
+
+    def test_dequantize_clone_with_names(self):
+        op = FP8Dequantize(x="x", output="y", scale_expr="s",
+                           src_dtype="fp8e4m3", dst_dtype="fp32")
+        cloned = op.clone_with_names({"x": "a"}, "b")
+        assert cloned.x == "a"
+        assert cloned.output == "b"
+        assert cloned.scale_expr == "s"
+        assert cloned.src_dtype == "fp8e4m3"
+
+
+# ── AmaxUpdate ───────────────────────────────────────────────────────────────
+
+
+class TestAmaxUpdate:
+    def test_amax_produces_scalar(self):
+        t = _make_tensor("x", dtype="fp8e4m3", expr="x")
+        ctx = {"x": t}
+        op = AmaxUpdate(x="x", output="amax_x", tensor_name="x")
+        result = op.apply(ctx)
+        assert result.global_shape == (1,)
+        assert result.local_shape == (1,)
+        assert result.dtype == "fp32"
+        assert "amax" in result.expr
+
+    def test_amax_requires_fp8_input(self):
+        t = _make_tensor("x", dtype="fp32")
+        ctx = {"x": t}
+        op = AmaxUpdate(x="x", output="amax_x", tensor_name="x")
+        with pytest.raises(ValueError, match="expected FP8 input"):
+            op.apply(ctx)
+
+    def test_amax_accepts_e5m2(self):
+        t = _make_tensor("x", dtype="fp8e5m2", expr="grad")
+        ctx = {"x": t}
+        op = AmaxUpdate(x="x", output="amax_g", tensor_name="grad")
+        result = op.apply(ctx)
+        assert result.dtype == "fp32"
+
+    def test_amax_output_is_replicated(self):
+        spec = _shard_spec(dim=0)
+        t = _make_tensor("x", shape=(8, 16), spec=spec, dtype="fp8e4m3")
+        ctx = {"x": t}
+        op = AmaxUpdate(x="x", output="amax_x", tensor_name="x")
+        result = op.apply(ctx)
+        for p in result.sharding.placements:
+            assert isinstance(p, Replicate)
+
+    def test_amax_vjp_empty(self):
+        t = _make_tensor("x", dtype="fp8e4m3")
+        ctx = {"x": t}
+        op = AmaxUpdate(x="x", output="amax_x", tensor_name="x")
+        result = op.apply(ctx)
+        grads = op.vjp(ctx, result)
+        assert grads == {}
+
+    def test_amax_clone_with_names(self):
+        op = AmaxUpdate(x="x", output="amax_x", tensor_name="x",
+                        iteration_expr="iter_0")
+        cloned = op.clone_with_names({"x": "a"}, "amax_a")
+        assert cloned.x == "a"
+        assert cloned.output == "amax_a"
+        assert cloned.tensor_name == "x"
+        assert cloned.iteration_expr == "iter_0"
+
+    def test_amax_iteration_expr_in_output(self):
+        t = _make_tensor("x", dtype="fp8e4m3", expr="x")
+        ctx = {"x": t}
+        op = AmaxUpdate(x="x", output="amax_x", tensor_name="x",
+                        iteration_expr="iter_3")
+        result = op.apply(ctx)
+        assert "iter_3" in result.expr
+
+
+# ── FP8 DtypeGuard ───────────────────────────────────────────────────────────
+
+
+class TestFP8DtypeGuard:
+    def test_e4m3_in_forward_ok(self):
+        t = _make_tensor("x", dtype="fp8e4m3")
+        assert DtypeGuard.check_fp8_format_usage(t, "forward") is None
+
+    def test_e5m2_in_forward_warns(self):
+        t = _make_tensor("x", dtype="fp8e5m2")
+        msg = DtypeGuard.check_fp8_format_usage(t, "forward")
+        assert msg is not None
+        assert "fp8e5m2" in msg
+        assert "forward" in msg
+
+    def test_e5m2_in_backward_ok(self):
+        t = _make_tensor("x", dtype="fp8e5m2")
+        assert DtypeGuard.check_fp8_format_usage(t, "backward") is None
+
+    def test_e4m3_in_backward_warns(self):
+        t = _make_tensor("x", dtype="fp8e4m3")
+        msg = DtypeGuard.check_fp8_format_usage(t, "backward")
+        assert msg is not None
+        assert "fp8e4m3" in msg
+        assert "backward" in msg
+
+    def test_non_fp8_no_warning(self):
+        t = _make_tensor("x", dtype="fp16")
+        assert DtypeGuard.check_fp8_format_usage(t, "forward") is None
+        assert DtypeGuard.check_fp8_format_usage(t, "backward") is None
+
+    def test_scale_freshness_ordered_ok(self):
+        msg = DtypeGuard.check_fp8_scale_freshness(
+            quantize_op_idx=5, amax_update_op_idx=2)
+        assert msg is None
+
+    def test_scale_freshness_stale_warns(self):
+        msg = DtypeGuard.check_fp8_scale_freshness(
+            quantize_op_idx=2, amax_update_op_idx=5)
+        assert msg is not None
+        assert "before AmaxUpdate" in msg
+
+    def test_scale_freshness_no_amax_errors(self):
+        msg = DtypeGuard.check_fp8_scale_freshness(
+            quantize_op_idx=3, amax_update_op_idx=None)
+        assert msg is not None
+        assert "no corresponding AmaxUpdate" in msg
+
+
+# ── FP8 End-to-End Pipeline ──────────────────────────────────────────────────
+
+
+class TestFP8Pipeline:
+    def test_forward_quantize_matmul_dequantize(self):
+        """Full FP8 forward: fp32 -> quantize(e4m3) -> matmul -> dequantize -> fp32."""
+        spec = _rep_spec()
+        x = _make_tensor("x", shape=(4, 8), spec=spec, dtype="fp32", expr="x")
+        w = _make_tensor("w", shape=(8, 16), spec=spec, dtype="fp32", expr="w")
+        ctx = {"x": x, "w": w}
+
+        q_x = FP8Quantize(x="x", output="x_q", scale_expr="sx",
+                          src_dtype="fp32", dst_dtype="fp8e4m3")
+        q_w = FP8Quantize(x="w", output="w_q", scale_expr="sw",
+                          src_dtype="fp32", dst_dtype="fp8e4m3")
+        q_x.apply(ctx)
+        q_w.apply(ctx)
+
+        assert ctx["x_q"].dtype == "fp8e4m3"
+        assert ctx["w_q"].dtype == "fp8e4m3"
+
+        mm = MatMul(a="x_q", b="w_q", output="y_q")
+        mm.apply(ctx)
+        assert ctx["y_q"].dtype == "fp8e4m3"
+
+        dq = FP8Dequantize(x="y_q", output="y", scale_expr="sy",
+                           src_dtype="fp8e4m3", dst_dtype="fp32")
+        dq.apply(ctx)
+        assert ctx["y"].dtype == "fp32"
+        assert ctx["y"].fp8_scale_expr is None
+        assert ctx["y"].global_shape == (4, 16)
+
+    def test_backward_uses_e5m2(self):
+        """Backward pass quantizes gradients to e5m2."""
+        t = _make_tensor("grad", dtype="fp32", expr="grad_loss")
+        ctx = {"grad": t}
+        op = FP8Quantize(x="grad", output="grad_q", scale_expr="sg",
+                         src_dtype="fp32", dst_dtype="fp8e5m2")
+        result = op.apply(ctx)
+        assert result.is_fp8e5m2
+        assert DtypeGuard.check_fp8_format_usage(result, "backward") is None
+        assert DtypeGuard.check_fp8_format_usage(result, "forward") is not None
+
+    def test_amax_update_after_forward(self):
+        """AmaxUpdate placed after forward computation."""
+        t = _make_tensor("x", dtype="fp32", expr="x")
+        ctx = {"x": t}
+
+        q = FP8Quantize(x="x", output="x_q", scale_expr="s",
+                        src_dtype="fp32", dst_dtype="fp8e4m3")
+        q.apply(ctx)
+
+        amax_op = AmaxUpdate(x="x_q", output="amax_x", tensor_name="x",
+                             iteration_expr="iter_0")
+        amax_result = amax_op.apply(ctx)
+        assert amax_result.dtype == "fp32"
+        assert amax_result.global_shape == (1,)
+
+    def test_quantize_dequantize_roundtrip_preserves_shape(self):
+        """Quantize then dequantize preserves shape and sharding."""
+        spec = _shard_spec(dim=0)
+        t = _make_tensor("x", shape=(8, 16), spec=spec, dtype="fp32", expr="x")
+        ctx = {"x": t}
+
+        q = FP8Quantize(x="x", output="x_q", scale_expr="s",
+                        src_dtype="fp32", dst_dtype="fp8e4m3")
+        q.apply(ctx)
+
+        dq = FP8Dequantize(x="x_q", output="x_back", scale_expr="s",
+                           src_dtype="fp8e4m3", dst_dtype="fp32")
+        dq.apply(ctx)
+
+        assert ctx["x_back"].global_shape == t.global_shape
+        assert ctx["x_back"].local_shape == t.local_shape
+        assert ctx["x_back"].sharding.placements == t.sharding.placements
+        assert ctx["x_back"].dtype == "fp32"
+
+    def test_delayed_scaling_ordering(self):
+        """Verify scale freshness check catches stale scale usage."""
+        # Correct: amax at op 2, quantize at op 5
+        assert DtypeGuard.check_fp8_scale_freshness(5, 2) is None
+
+        # Wrong: quantize at op 1, amax at op 4
+        msg = DtypeGuard.check_fp8_scale_freshness(1, 4)
+        assert msg is not None
+
+    def test_fp8_on_mesh_executor(self):
+        """FP8 ops work through MultiDeviceExecutor."""
+        mesh = _mesh2()
+        spec = _rep_spec(mesh)
+        t = _make_tensor("x", shape=(4, 8), spec=spec, dtype="fp32", expr="x")
+
+        prog = Program(name="fp8_test")
+        prog.add(FP8Quantize(x="x", output="x_q", scale_expr="s",
+                             src_dtype="fp32", dst_dtype="fp8e4m3"))
+        prog.add(AmaxUpdate(x="x_q", output="amax_x", tensor_name="x"))
+
+        executor = MultiDeviceExecutor(mesh=mesh)
+        executor.register_tensor(t)
+        executor.run_program(prog)
+
+        for dev_id in range(mesh.num_devices):
+            xq = executor.get_tensor("x_q", dev_id)
+            assert xq is not None
+            assert xq.dtype == "fp8e4m3"
+            assert xq.fp8_scale_expr == "s"
+            amax = executor.get_tensor("amax_x", dev_id)
+            assert amax is not None
+            assert amax.dtype == "fp32"
