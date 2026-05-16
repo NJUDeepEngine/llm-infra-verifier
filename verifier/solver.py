@@ -37,10 +37,37 @@ from .ir import (
     AllReduce,
     AllGather,
     ReduceScatter,
+    Broadcast,
+    Reduce,
+    AllToAll,
+    Scatter,
+    Gather,
     Send,
     Recv,
     FlashAttention,
+    Reshape,
+    Transpose,
+    Cast,
+    LossScale,
+    FP8Quantize,
+    FP8Dequantize,
+    AmaxUpdate,
+    ZeROGatherParam,
+    ZeROScatterGrad,
+    ZeROPartitionOptState,
+    RingRotate,
+    RingAttentionStep,
+    MoEDispatch,
+    MoECombine,
+    ExpertCompute,
+    TopKGate,
+    AllReduceAsync,
+    OverlapRegion,
+    Reinterpret,
+    Convert,
 )
+from .ir.collective import CollectiveOp
+from .ir.compute import ElementWiseBinaryOp
 from .schedules import MicroBatch, PP1F1BSchedule, DeadlockChecker
 
 
@@ -140,48 +167,105 @@ class Z3PlacementSolver:
         for d, s in enumerate(shape):
             self.solver.add(gs[d] == s)
 
+    # ── Placement encoding helpers ────────────────────────────────────────
+
+    def _encode_matmul(self, op):
+        R, S0, S1, P = IntVal(PL_R), IntVal(PL_S0), IntVal(PL_S1), IntVal(PL_P)
+        a, b, y = self._var(op.a), self._var(op.b), self._var(op.output)
+        self.solver.add(y == If(Or(a == P, b == P), P,
+                            If(And(a == S1, b == S0), P,
+                            If(And(a == R,  b == S1), S1,
+                            If(And(a == S0, b == R),  S0,
+                            If(And(a == R,  b == R),  R,
+                            If(And(a == S1, b == R),  S1,
+                            If(And(a == R,  b == S0), S0,
+                            P))))))))
+
+    def _encode_elementwise(self, op):
+        R = IntVal(PL_R)
+        a, b, y = self._var(op.a), self._var(op.b), self._var(op.output)
+        self.solver.add(y == If(a == R, b, If(b == R, a, a)))
+
+    def _encode_passthrough(self, op):
+        x_name = op.input_names[0]
+        x, y = self._var(x_name), self._var(op.output_name)
+        self.solver.add(y == x)
+
+    def _encode_to_replicate(self, op):
+        y = self._var(op.output_name)
+        self.solver.add(y == IntVal(PL_R))
+
+    def _encode_reducescatter(self, op):
+        y = self._var(op.output)
+        sd = op.scatter_dim
+        self.solver.add(y == IntVal(PL_S0 if sd == 0 else PL_S1))
+
+    def _encode_alltoall(self, op):
+        y = self._var(op.output)
+        cd = op.concat_dim
+        self.solver.add(y == IntVal(PL_S0 if cd == 0 else PL_S1))
+
+    def _encode_flash_attention(self, op):
+        q, y = self._var(op.q), self._var(op.output)
+        self.solver.add(y == q)
+
     def encode_program(self, program: Program):
         """Walk all ops and add Z3 constraints for placement propagation."""
-        R, S0, S1, P = IntVal(PL_R), IntVal(PL_S0), IntVal(PL_S1), IntVal(PL_P)
-
         for op in program.ops:
             if isinstance(op, MatMul):
-                a, b, y = self._var(op.a), self._var(op.b), self._var(op.output)
-                # MatMul C = A[M,K] @ B[K,N]:
-                #   S(1)×S(0) → P  (contracting dim sharded in both)
-                #   R×S(1) → S(1)  (column parallel)
-                #   S(0)×R → S(0)  (batch sharded)
-                #   R×R → R
-                #   P×any or any×P → P
-                self.solver.add(y == If(Or(a == P, b == P), P,
-                                    If(And(a == S1, b == S0), P,
-                                    If(And(a == R,  b == S1), S1,
-                                    If(And(a == S0, b == R),  S0,
-                                    If(And(a == R,  b == R),  R,
-                                    If(And(a == S1, b == R),  S1,
-                                    If(And(a == R,  b == S0), S0,
-                                    P))))))))
-
-            elif isinstance(op, (Add, Multiply)):
-                a, b, y = self._var(op.a), self._var(op.b), self._var(op.output)
-                # Element-wise: R+X→X, X+R→X, same→same
-                self.solver.add(y == If(a == R, b, If(b == R, a, a)))
-
-            elif isinstance(op, SiLU):
-                x, y = self._var(op.x), self._var(op.output)
-                self.solver.add(y == x)
-
+                self._encode_matmul(op)
+            elif isinstance(op, ElementWiseBinaryOp):
+                self._encode_elementwise(op)
             elif isinstance(op, FlashAttention):
-                q, y = self._var(op.q), self._var(op.output)
-                self.solver.add(y == q)
-
-            elif isinstance(op, AllReduce):
+                self._encode_flash_attention(op)
+            elif isinstance(op, ReduceScatter):
+                self._encode_reducescatter(op)
+            elif isinstance(op, AllToAll):
+                self._encode_alltoall(op)
+            elif isinstance(op, (AllReduce, AllGather, Broadcast, Reduce, Gather)):
+                self._encode_to_replicate(op)
+            elif isinstance(op, Scatter):
                 y = self._var(op.output)
-                self.solver.add(y == R)
-
-            elif isinstance(op, AllGather):
+                sd = op.scatter_dim
+                self.solver.add(y == IntVal(PL_S0 if sd == 0 else PL_S1))
+            elif isinstance(op, (ZeROGatherParam,)):
+                self._encode_to_replicate(op)
+            elif isinstance(op, ZeROScatterGrad):
                 y = self._var(op.output)
-                self.solver.add(y == R)
+                sd = op.scatter_dim
+                self.solver.add(y == IntVal(PL_S0 if sd == 0 else PL_S1))
+            elif isinstance(op, (SiLU, Reshape, Transpose, Cast, LossScale,
+                                 FP8Quantize, FP8Dequantize,
+                                 Reinterpret, Convert,
+                                 RingAttentionStep, ExpertCompute)):
+                self._encode_passthrough(op)
+            elif isinstance(op, (OverlapRegion,)):
+                for sub in op.compute_ops + op.comm_ops:
+                    self._encode_op_single(sub)
+            elif isinstance(op, (AllReduceAsync,)):
+                self._encode_passthrough(op)
+            elif isinstance(op, TopKGate):
+                self._encode_passthrough(op)
+            elif isinstance(op, (MoEDispatch, MoECombine)):
+                self._encode_passthrough(op)
+
+    def _encode_op_single(self, op):
+        """Encode a single op (used for OverlapRegion sub-ops)."""
+        if isinstance(op, MatMul):
+            self._encode_matmul(op)
+        elif isinstance(op, ElementWiseBinaryOp):
+            self._encode_elementwise(op)
+        elif isinstance(op, (AllReduce, AllGather, Broadcast, Reduce, Gather)):
+            self._encode_to_replicate(op)
+        elif isinstance(op, ReduceScatter):
+            self._encode_reducescatter(op)
+        elif isinstance(op, AllToAll):
+            self._encode_alltoall(op)
+        elif isinstance(op, FlashAttention):
+            self._encode_flash_attention(op)
+        else:
+            if hasattr(op, 'input_names') and op.input_names:
+                self._encode_passthrough(op)
 
     def check_output_equivalence(
         self,
@@ -233,55 +317,165 @@ class Z3PlacementSolver:
 
         return results
 
+    def _check_precondition(
+        self, op_name: str, input_name: str,
+        required_pl: int, required_label: str,
+    ) -> VerifyResult:
+        """Check that an op's input always has the required placement."""
+        x = self._vars.get(input_name)
+        if x is None:
+            return VerifyResult(
+                passed=True,
+                condition=f"{op_name}({input_name}) precondition",
+                details=f"Input '{input_name}' not in Z3 model (skipped)",
+            )
+
+        self.solver.push()
+        self.solver.add(x != IntVal(required_pl))
+
+        check = self.solver.check()
+        if check == sat:
+            model = self.solver.model()
+            val = model.eval(x, model_completion=True).as_long()
+            result = VerifyResult(
+                passed=False,
+                condition=f"{op_name}({input_name}) precondition",
+                details=(
+                    f"Input '{input_name}' can be {_PL_NAMES.get(val, '?')}, "
+                    f"not {required_label} — {op_name} may be unnecessary"
+                ),
+            )
+        else:
+            result = VerifyResult(
+                passed=True,
+                condition=f"{op_name}({input_name}) precondition",
+                details=(
+                    f"Z3 proved: '{input_name}' is always {required_label} "
+                    f"before {op_name}"
+                ),
+            )
+
+        self.solver.pop()
+        return result
+
+    def _check_precondition_or(
+        self, op_name: str, input_name: str,
+        allowed_pls: List[int], label: str,
+    ) -> VerifyResult:
+        """Check that an op's input always has one of the allowed placements."""
+        x = self._vars.get(input_name)
+        if x is None:
+            return VerifyResult(
+                passed=True,
+                condition=f"{op_name}({input_name}) precondition",
+                details=f"Input '{input_name}' not in Z3 model (skipped)",
+            )
+
+        self.solver.push()
+        self.solver.add(And(*[x != IntVal(pl) for pl in allowed_pls]))
+
+        check = self.solver.check()
+        if check == sat:
+            model = self.solver.model()
+            val = model.eval(x, model_completion=True).as_long()
+            result = VerifyResult(
+                passed=False,
+                condition=f"{op_name}({input_name}) precondition",
+                details=(
+                    f"Input '{input_name}' can be {_PL_NAMES.get(val, '?')}, "
+                    f"not {label} — {op_name} may be incorrect"
+                ),
+            )
+        else:
+            result = VerifyResult(
+                passed=True,
+                condition=f"{op_name}({input_name}) precondition",
+                details=(
+                    f"Z3 proved: '{input_name}' is always {label} "
+                    f"before {op_name}"
+                ),
+            )
+
+        self.solver.pop()
+        return result
+
     def check_collective_preconditions(
         self,
         program: Program,
     ) -> List[VerifyResult]:
-        """Verify AllReduce preconditions: input must always be Partial.
+        """Verify collective preconditions via Z3.
 
-        For each AllReduce, Z3 checks whether its input can be non-Partial.
-        UNSAT → input is always Partial (correct usage).
-        SAT → input may not be Partial (unnecessary or wrong AllReduce).
+        For each collective, checks that its input placement satisfies
+        the required precondition:
+          - AllReduce/Reduce: input must be Partial
+          - AllGather: input must be Shard(gather_dim)
+          - ReduceScatter: input must be Replicate or Partial
         """
         results = []
-        P = IntVal(PL_P)
 
         for op in program.ops:
-            if isinstance(op, AllReduce):
-                x = self._vars.get(op.x)
-                if x is None:
-                    continue
-
-                self.solver.push()
-                self.solver.add(x != P)
-
-                check = self.solver.check()
-                if check == sat:
-                    model = self.solver.model()
-                    val = model.eval(x, model_completion=True).as_long()
-                    results.append(VerifyResult(
-                        passed=False,
-                        condition=f"AllReduce({op.x}) precondition",
-                        details=(
-                            f"Input '{op.x}' can be {_PL_NAMES.get(val, '?')}, "
-                            f"not Partial — AllReduce may be unnecessary"
-                        ),
-                    ))
-                else:
-                    results.append(VerifyResult(
-                        passed=True,
-                        condition=f"AllReduce({op.x}) precondition",
-                        details=(
-                            f"Z3 proved: '{op.x}' is always Partial "
-                            f"before AllReduce"
-                        ),
-                    ))
-
-                self.solver.pop()
+            if isinstance(op, (AllReduce, Reduce)):
+                results.append(self._check_precondition(
+                    type(op).__name__, op.x, PL_P, "Partial",
+                ))
+            elif isinstance(op, AllGather):
+                expected_pl = PL_S0 if op.gather_dim == 0 else PL_S1
+                expected_label = f"Shard({op.gather_dim})"
+                results.append(self._check_precondition(
+                    "AllGather", op.x, expected_pl, expected_label,
+                ))
+            elif isinstance(op, ReduceScatter):
+                results.append(self._check_precondition_or(
+                    "ReduceScatter", op.x,
+                    [PL_R, PL_P], "Replicate or Partial",
+                ))
+            elif isinstance(op, AllToAll):
+                expected_pl = PL_S0 if op.split_dim == 0 else PL_S1
+                expected_label = f"Shard({op.split_dim})"
+                results.append(self._check_precondition(
+                    "AllToAll", op.x, expected_pl, expected_label,
+                ))
+            elif isinstance(op, Gather):
+                expected_pl = PL_S0 if op.gather_dim == 0 else PL_S1
+                expected_label = f"Shard({op.gather_dim})"
+                results.append(self._check_precondition(
+                    "Gather", op.x, expected_pl, expected_label,
+                ))
 
         return results
 
     # ── L1: Shape consistency ───────────────────────────────────────────────
+
+    def _add_local_shape_constraints(self, gs, ls, pl, tp):
+        """Add local_shape = global / tp_if_sharded for each dim."""
+        S0, S1 = IntVal(PL_S0), IntVal(PL_S1)
+        for d in range(len(gs)):
+            self.solver.add(ls[d] == If(
+                And(pl == S0, IntVal(d) == 0), gs[d] / tp,
+                If(And(pl == S1, IntVal(d) == 1), gs[d] / tp,
+                   gs[d])))
+
+    def _encode_shape_passthrough(self, op, tp):
+        """Shape constraint for ops that preserve shape (SiLU, Cast, etc.)."""
+        x_name = op.input_names[0]
+        if x_name not in self._shape_vars:
+            return
+        gs_x = self._shape_vars[x_name]
+        gs_y, ls_y = self._shape_var(op.output_name)
+        pl_y = self._var(op.output_name)
+        for d in range(len(gs_x)):
+            self.solver.add(gs_y[d] == gs_x[d])
+        self._add_local_shape_constraints(gs_y, ls_y, pl_y, tp)
+
+    def _encode_shape_collective_preserve(self, op, tp):
+        """Shape constraint for collectives that preserve global shape (AllReduce, Broadcast)."""
+        if op.x not in self._shape_vars:
+            return
+        gs_x = self._shape_vars[op.x]
+        gs_y, ls_y = self._shape_var(op.output)
+        for d in range(len(gs_x)):
+            self.solver.add(gs_y[d] == gs_x[d])
+            self.solver.add(ls_y[d] == gs_y[d])
 
     def encode_shape_constraints(self, program: Program, tp_size: int):
         """Add Z3 constraints for shape correctness (L1).
@@ -293,23 +487,18 @@ class Z3PlacementSolver:
         (e) Add/Mul:      a.global_shape == b.global_shape
         """
         self._tp_size = tp_size
-        R, S0, S1, P = IntVal(PL_R), IntVal(PL_S0), IntVal(PL_S1), IntVal(PL_P)
+        S0, S1 = IntVal(PL_S0), IntVal(PL_S1)
         tp = IntVal(tp_size)
 
         for name in list(self._shape_vars.keys()):
             gs, ls = self._shape_vars[name], self._local_vars[name]
             pl = self._var(name)
             for d in range(len(gs)):
-                # Divisibility: if sharded on this dim, must be divisible
                 if d == 0:
                     self.solver.add(Implies(pl == S0, gs[d] % tp == 0))
                 elif d == 1:
                     self.solver.add(Implies(pl == S1, gs[d] % tp == 0))
-                # Local shape derivation
-                self.solver.add(ls[d] == If(
-                    And(pl == S0, IntVal(d) == 0), gs[d] / tp,
-                    If(And(pl == S1, IntVal(d) == 1), gs[d] / tp,
-                       gs[d])))
+            self._add_local_shape_constraints(gs, ls, pl, tp)
 
         for op in program.ops:
             if isinstance(op, MatMul):
@@ -317,85 +506,95 @@ class Z3PlacementSolver:
                     continue
                 gs_a = self._shape_vars[op.a]
                 gs_b = self._shape_vars[op.b]
-
                 gs_y, ls_y = self._shape_var(op.output)
                 pl_y = self._var(op.output)
-
-                # Contraction dim: a.cols == b.rows (global shapes must match)
                 self.solver.add(gs_a[1] == gs_b[0])
-                # Output shape: rows from A, cols from B
                 self.solver.add(gs_y[0] == gs_a[0])
                 self.solver.add(gs_y[1] == gs_b[1])
-                # Output local shape
-                for d in range(2):
-                    if d == 0:
-                        self.solver.add(ls_y[d] == If(
-                            And(pl_y == S0, IntVal(d) == 0), gs_y[d] / tp,
-                            If(And(pl_y == S1, IntVal(d) == 1), gs_y[d] / tp,
-                               gs_y[d])))
-                    else:
-                        self.solver.add(ls_y[d] == If(
-                            And(pl_y == S0, IntVal(d) == 0), gs_y[d] / tp,
-                            If(And(pl_y == S1, IntVal(d) == 1), gs_y[d] / tp,
-                               gs_y[d])))
+                self._add_local_shape_constraints(gs_y, ls_y, pl_y, tp)
 
-            elif isinstance(op, (Add, Multiply)):
+            elif isinstance(op, ElementWiseBinaryOp):
                 if op.a not in self._shape_vars or op.b not in self._shape_vars:
                     continue
                 gs_a = self._shape_vars[op.a]
                 gs_b = self._shape_vars[op.b]
-                # Element-wise requires same global shape
                 for d in range(min(len(gs_a), len(gs_b))):
                     self.solver.add(gs_a[d] == gs_b[d])
-                # Output shape == input shape
                 gs_y, ls_y = self._shape_var(op.output)
                 pl_y = self._var(op.output)
                 for d in range(min(len(gs_a), len(gs_y))):
                     self.solver.add(gs_y[d] == gs_a[d])
-                    self.solver.add(ls_y[d] == If(
-                        And(pl_y == S0, IntVal(d) == 0), gs_y[d] / tp,
-                        If(And(pl_y == S1, IntVal(d) == 1), gs_y[d] / tp,
-                           gs_y[d])))
-
-            elif isinstance(op, SiLU):
-                if op.x not in self._shape_vars:
-                    continue
-                gs_x = self._shape_vars[op.x]
-                gs_y, ls_y = self._shape_var(op.output)
-                pl_y = self._var(op.output)
-                for d in range(len(gs_x)):
-                    self.solver.add(gs_y[d] == gs_x[d])
-                    self.solver.add(ls_y[d] == If(
-                        And(pl_y == S0, IntVal(d) == 0), gs_y[d] / tp,
-                        If(And(pl_y == S1, IntVal(d) == 1), gs_y[d] / tp,
-                           gs_y[d])))
+                self._add_local_shape_constraints(gs_y, ls_y, pl_y, tp)
 
             elif isinstance(op, FlashAttention):
-                # FlashAttention output shape is unconstrained from inputs
-                # because the IR may use fused QKV (3H) while output is (H).
-                # The downstream MatMul contraction constraint will determine
-                # the actual output dimension.
                 gs_y, ls_y = self._shape_var(op.output)
                 pl_y = self._var(op.output)
                 if op.q in self._shape_vars:
                     gs_q = self._shape_vars[op.q]
-                    # Batch dim (d0) is preserved
                     self.solver.add(gs_y[0] == gs_q[0])
-                    # d1 is NOT constrained from Q (may be fused QKV)
-                for d in range(2):
-                    self.solver.add(ls_y[d] == If(
-                        And(pl_y == S0, IntVal(d) == 0), gs_y[d] / tp,
-                        If(And(pl_y == S1, IntVal(d) == 1), gs_y[d] / tp,
-                           gs_y[d])))
+                self._add_local_shape_constraints(gs_y, ls_y, pl_y, tp)
 
-            elif isinstance(op, AllReduce):
+            elif isinstance(op, (AllReduce, Broadcast, Reduce)):
+                self._encode_shape_collective_preserve(op, tp)
+
+            elif isinstance(op, AllGather):
                 if op.x not in self._shape_vars:
                     continue
                 gs_x = self._shape_vars[op.x]
                 gs_y, ls_y = self._shape_var(op.output)
                 for d in range(len(gs_x)):
-                    self.solver.add(gs_y[d] == gs_x[d])
+                    if d == op.gather_dim:
+                        self.solver.add(gs_y[d] == gs_x[d] * tp)
+                    else:
+                        self.solver.add(gs_y[d] == gs_x[d])
                     self.solver.add(ls_y[d] == gs_y[d])
+
+            elif isinstance(op, ReduceScatter):
+                if op.x not in self._shape_vars:
+                    continue
+                gs_x = self._shape_vars[op.x]
+                gs_y, ls_y = self._shape_var(op.output)
+                pl_y = self._var(op.output)
+                for d in range(len(gs_x)):
+                    self.solver.add(gs_y[d] == gs_x[d])
+                self._add_local_shape_constraints(gs_y, ls_y, pl_y, tp)
+
+            elif isinstance(op, AllToAll):
+                if op.x not in self._shape_vars:
+                    continue
+                gs_x = self._shape_vars[op.x]
+                gs_y, ls_y = self._shape_var(op.output)
+                pl_y = self._var(op.output)
+                for d in range(len(gs_x)):
+                    self.solver.add(gs_y[d] == gs_x[d])
+                self._add_local_shape_constraints(gs_y, ls_y, pl_y, tp)
+
+            elif isinstance(op, Scatter):
+                if op.x not in self._shape_vars:
+                    continue
+                gs_x = self._shape_vars[op.x]
+                gs_y, ls_y = self._shape_var(op.output)
+                pl_y = self._var(op.output)
+                for d in range(len(gs_x)):
+                    self.solver.add(gs_y[d] == gs_x[d])
+                self._add_local_shape_constraints(gs_y, ls_y, pl_y, tp)
+
+            elif isinstance(op, Gather):
+                if op.x not in self._shape_vars:
+                    continue
+                gs_x = self._shape_vars[op.x]
+                gs_y, ls_y = self._shape_var(op.output)
+                for d in range(len(gs_x)):
+                    if d == op.gather_dim:
+                        self.solver.add(gs_y[d] == gs_x[d] * tp)
+                    else:
+                        self.solver.add(gs_y[d] == gs_x[d])
+                    self.solver.add(ls_y[d] == gs_y[d])
+
+            elif isinstance(op, (SiLU, Cast, LossScale, Reshape, Transpose,
+                                 FP8Quantize, FP8Dequantize,
+                                 Reinterpret, Convert)):
+                self._encode_shape_passthrough(op, tp)
 
     def check_shape_consistency(self) -> List[VerifyResult]:
         """Check all shape constraints. SAT means a violation exists."""
@@ -678,19 +877,19 @@ class DistributedVerifier:
                         merged_states[name] = ts
 
         for op in program.ops:
-            if isinstance(op, AllReduce):
-                # Check actual tensor state if available (across all devices)
+            if isinstance(op, (AllReduce, Reduce)):
                 if op.x in merged_states:
                     ts = merged_states[op.x]
                     if not ts.partial:
                         errors.append(
-                            f"AllReduce({op.x}) called on non-partial tensor: {ts.sharding}"
+                            f"{type(op).__name__}({op.x}) called on non-partial "
+                            f"tensor: {ts.sharding}"
                         )
                 else:
                     import warnings
                     warnings.warn(
-                        f"AllReduce({op.x}): no tensor state available to verify "
-                        f"precondition (input should be Partial)"
+                        f"{type(op).__name__}({op.x}): no tensor state available "
+                        f"to verify precondition (input should be Partial)"
                     )
 
             elif isinstance(op, AllGather):
@@ -706,8 +905,46 @@ class DistributedVerifier:
                             f"not sharded on dim {op.gather_dim}: {ts.sharding}"
                         )
 
+            elif isinstance(op, ReduceScatter):
+                if op.x in merged_states:
+                    ts = merged_states[op.x]
+                    has_shard_on_scatter = any(
+                        isinstance(p, Shard) and p.dim == op.scatter_dim
+                        for p in ts.sharding.placements
+                    )
+                    if has_shard_on_scatter:
+                        errors.append(
+                            f"ReduceScatter({op.x}, dim={op.scatter_dim}) called on "
+                            f"tensor already sharded on dim {op.scatter_dim}: {ts.sharding}"
+                        )
+
+            elif isinstance(op, AllToAll):
+                if op.x in merged_states:
+                    ts = merged_states[op.x]
+                    has_shard_on_split = any(
+                        isinstance(p, Shard) and p.dim == op.split_dim
+                        for p in ts.sharding.placements
+                    )
+                    if not has_shard_on_split:
+                        errors.append(
+                            f"AllToAll({op.x}, split={op.split_dim}) called on tensor "
+                            f"not sharded on dim {op.split_dim}: {ts.sharding}"
+                        )
+
+            elif isinstance(op, Gather):
+                if op.x in merged_states:
+                    ts = merged_states[op.x]
+                    has_shard_on_dim = any(
+                        isinstance(p, Shard) and p.dim == op.gather_dim
+                        for p in ts.sharding.placements
+                    )
+                    if not has_shard_on_dim:
+                        errors.append(
+                            f"Gather({op.x}, dim={op.gather_dim}) called on tensor "
+                            f"not sharded on dim {op.gather_dim}: {ts.sharding}"
+                        )
+
             elif isinstance(op, Send):
-                # Check that there's a matching Recv
                 has_matching = any(
                     isinstance(o, Recv)
                     and o.src == op.src
@@ -722,7 +959,6 @@ class DistributedVerifier:
                     )
 
             elif isinstance(op, Recv):
-                # Check that there's a matching Send
                 has_matching = any(
                     isinstance(o, Send)
                     and o.src == op.src
@@ -758,13 +994,22 @@ class DistributedVerifier:
         """
         errors = []
 
-        # Map of dual relations
         dual_map = {
             "AllReduce": "AllReduce",
             "AllGather": "ReduceScatter",
             "ReduceScatter": "AllGather",
             "Send": "Recv",
             "Recv": "Send",
+            "Broadcast": "Reduce",
+            "Reduce": "Broadcast",
+            "ZeROGatherParam": "ZeROScatterGrad",
+            "ZeROScatterGrad": "ZeROGatherParam",
+            "AllToAll": "AllToAll",
+            "Scatter": "Gather",
+            "Gather": "Scatter",
+            "MoEDispatch": "MoECombine",
+            "MoECombine": "MoEDispatch",
+            "RingRotate": "RingRotate",
         }
 
         fwd_collectives = [op for op in fwd_program.ops if op.is_collective()]
@@ -777,31 +1022,13 @@ class DistributedVerifier:
             if expected_dual is None:
                 continue
 
-            # Check if there exists a bwd collective of the dual type
             found = False
             for bwd_op in bwd_collectives:
                 bwd_type = type(bwd_op).__name__
                 if bwd_type == expected_dual:
-                    # Check more specific properties
-                    if isinstance(fwd_op, AllReduce) and isinstance(bwd_op, AllReduce):
+                    if self._check_dual_match(fwd_op, bwd_op):
                         found = True
                         break
-                    elif isinstance(fwd_op, AllGather) and isinstance(bwd_op, ReduceScatter):
-                        if fwd_op.gather_dim == bwd_op.scatter_dim:
-                            found = True
-                            break
-                    elif isinstance(fwd_op, ReduceScatter) and isinstance(bwd_op, AllGather):
-                        if fwd_op.scatter_dim == bwd_op.gather_dim:
-                            found = True
-                            break
-                    elif isinstance(fwd_op, Send) and isinstance(bwd_op, Recv):
-                        if fwd_op.src == bwd_op.dst and fwd_op.dst == bwd_op.src:
-                            found = True
-                            break
-                    elif isinstance(fwd_op, Recv) and isinstance(bwd_op, Send):
-                        if fwd_op.src == bwd_op.dst and fwd_op.dst == bwd_op.src:
-                            found = True
-                            break
 
             if not found:
                 errors.append(
@@ -821,11 +1048,51 @@ class DistributedVerifier:
         self.results.append(vr)
         return vr
 
+    @staticmethod
+    def _check_dual_match(fwd_op: IROp, bwd_op: IROp) -> bool:
+        """Check property-level match between a forward op and its backward dual."""
+        if isinstance(fwd_op, AllReduce) and isinstance(bwd_op, AllReduce):
+            return True
+        if isinstance(fwd_op, AllGather) and isinstance(bwd_op, ReduceScatter):
+            return fwd_op.gather_dim == bwd_op.scatter_dim
+        if isinstance(fwd_op, ReduceScatter) and isinstance(bwd_op, AllGather):
+            return fwd_op.scatter_dim == bwd_op.gather_dim
+        if isinstance(fwd_op, Send) and isinstance(bwd_op, Recv):
+            return fwd_op.src == bwd_op.dst and fwd_op.dst == bwd_op.src
+        if isinstance(fwd_op, Recv) and isinstance(bwd_op, Send):
+            return fwd_op.src == bwd_op.dst and fwd_op.dst == bwd_op.src
+        if isinstance(fwd_op, Broadcast) and isinstance(bwd_op, Reduce):
+            return True
+        if isinstance(fwd_op, Reduce) and isinstance(bwd_op, Broadcast):
+            return True
+        if isinstance(fwd_op, ZeROGatherParam) and isinstance(bwd_op, ZeROScatterGrad):
+            return fwd_op.gather_dim == bwd_op.scatter_dim
+        if isinstance(fwd_op, ZeROScatterGrad) and isinstance(bwd_op, ZeROGatherParam):
+            return fwd_op.scatter_dim == bwd_op.gather_dim
+        if isinstance(fwd_op, MoEDispatch) and isinstance(bwd_op, MoECombine):
+            return (fwd_op.split_dim == bwd_op.concat_dim and
+                    fwd_op.concat_dim == bwd_op.split_dim)
+        if isinstance(fwd_op, MoECombine) and isinstance(bwd_op, MoEDispatch):
+            return (fwd_op.split_dim == bwd_op.concat_dim and
+                    fwd_op.concat_dim == bwd_op.split_dim)
+        if isinstance(fwd_op, AllToAll) and isinstance(bwd_op, AllToAll):
+            return (fwd_op.split_dim == bwd_op.concat_dim and
+                    fwd_op.concat_dim == bwd_op.split_dim)
+        if isinstance(fwd_op, Scatter) and isinstance(bwd_op, Gather):
+            return fwd_op.scatter_dim == bwd_op.gather_dim
+        if isinstance(fwd_op, Gather) and isinstance(bwd_op, Scatter):
+            return fwd_op.gather_dim == bwd_op.scatter_dim
+        if isinstance(fwd_op, RingRotate) and isinstance(bwd_op, RingRotate):
+            return (fwd_op.ring_size == bwd_op.ring_size and
+                    fwd_op.ring_dim == bwd_op.ring_dim)
+        return True
+
     def verify_placement_consistency(
         self,
         program: Program,
         input_placements: Optional[Dict[str, Placement]] = None,
         final_tensors: Optional[Dict[str, TensorState]] = None,
+        output_names: Optional[List[str]] = None,
     ) -> VerifyResult:
         """Verify placement consistency using Z3 SMT solver.
 
@@ -848,11 +1115,12 @@ class DistributedVerifier:
 
         z3s.encode_program(program)
 
-        all_inputs = {inp for op in program.ops for inp in op.input_names}
-        output_names = [
-            op.output_name for op in program.ops
-            if op.output_name not in all_inputs
-        ]
+        if output_names is None:
+            all_inputs = {inp for op in program.ops for inp in op.input_names}
+            output_names = [
+                op.output_name for op in program.ops
+                if op.output_name not in all_inputs
+            ]
 
         eq_results = z3s.check_output_equivalence(output_names)
         pc_results = z3s.check_collective_preconditions(program)
@@ -1000,7 +1268,9 @@ class DistributedVerifier:
             self.verify_gradient_duality(program, bwd_program)
 
         # 4. Placement consistency
-        self.verify_placement_consistency(program, final_tensors=final_tensors)
+        self.verify_placement_consistency(
+            program, final_tensors=final_tensors, output_names=output_names,
+        )
 
         # 5. Shape consistency
         if initial_shapes:

@@ -501,3 +501,523 @@ class FlashAttention(IROp):
 
     def __repr__(self):
         return f"FlashAttention({self.q}, {self.k}, {self.v}) -> {self.output}"
+
+
+@dataclass
+class GELU(IROp):
+    """GELU activation: Y = X * Phi(X)."""
+    x: str
+    output: str
+
+    @property
+    def input_names(self) -> List[str]:
+        return [self.x]
+
+    @property
+    def output_name(self) -> str:
+        return self.output
+
+    def propagate_spmd_type(self, input_types):
+        return input_types.get(self.x)
+
+    def apply(self, ctx: Dict[str, TensorState]) -> TensorState:
+        x = ctx[self.x]
+        result = TensorState(
+            name=self.output,
+            global_shape=x.global_shape,
+            local_shape=x.local_shape,
+            sharding=x.sharding,
+            dtype=x.dtype,
+            expr=f"gelu({x.expr})" if x.expr else "",
+            requires_grad=x.requires_grad,
+            grad_name=f"grad_{self.output}",
+        )
+        ctx[self.output] = result
+        return result
+
+    def vjp(self, ctx, grad_output):
+        x = ctx[self.x]
+        grad_x = TensorState(
+            name=f"grad_{self.x}",
+            global_shape=x.global_shape,
+            local_shape=x.local_shape,
+            sharding=x.sharding,
+            dtype=x.dtype,
+            expr=f"gelu_grad({x.expr})",
+        )
+        return {self.x: grad_x}
+
+    def clone_with_names(self, input_map, output_name):
+        return GELU(x=input_map.get(self.x, self.x), output=output_name)
+
+    def __repr__(self):
+        return f"GELU({self.x}) -> {self.output}"
+
+
+@dataclass
+class ReLU(IROp):
+    """ReLU activation: Y = max(0, X)."""
+    x: str
+    output: str
+
+    @property
+    def input_names(self) -> List[str]:
+        return [self.x]
+
+    @property
+    def output_name(self) -> str:
+        return self.output
+
+    def propagate_spmd_type(self, input_types):
+        return input_types.get(self.x)
+
+    def apply(self, ctx: Dict[str, TensorState]) -> TensorState:
+        x = ctx[self.x]
+        result = TensorState(
+            name=self.output,
+            global_shape=x.global_shape,
+            local_shape=x.local_shape,
+            sharding=x.sharding,
+            dtype=x.dtype,
+            expr=f"relu({x.expr})" if x.expr else "",
+            requires_grad=x.requires_grad,
+            grad_name=f"grad_{self.output}",
+        )
+        ctx[self.output] = result
+        return result
+
+    def vjp(self, ctx, grad_output):
+        x = ctx[self.x]
+        grad_x = TensorState(
+            name=f"grad_{self.x}",
+            global_shape=x.global_shape,
+            local_shape=x.local_shape,
+            sharding=x.sharding,
+            dtype=x.dtype,
+            expr=f"relu_grad({x.expr})",
+        )
+        return {self.x: grad_x}
+
+    def clone_with_names(self, input_map, output_name):
+        return ReLU(x=input_map.get(self.x, self.x), output=output_name)
+
+    def __repr__(self):
+        return f"ReLU({self.x}) -> {self.output}"
+
+
+@dataclass
+class Dropout(IROp):
+    """Dropout: Y = X * mask / (1 - p) during training."""
+    x: str
+    output: str
+    p: float = 0.1
+
+    @property
+    def input_names(self) -> List[str]:
+        return [self.x]
+
+    @property
+    def output_name(self) -> str:
+        return self.output
+
+    def propagate_spmd_type(self, input_types):
+        return input_types.get(self.x)
+
+    def apply(self, ctx: Dict[str, TensorState]) -> TensorState:
+        x = ctx[self.x]
+        result = TensorState(
+            name=self.output,
+            global_shape=x.global_shape,
+            local_shape=x.local_shape,
+            sharding=x.sharding,
+            dtype=x.dtype,
+            expr=f"dropout({x.expr}, p={self.p})" if x.expr else "",
+            requires_grad=x.requires_grad,
+            grad_name=f"grad_{self.output}",
+        )
+        ctx[self.output] = result
+        return result
+
+    def vjp(self, ctx, grad_output):
+        x = ctx[self.x]
+        grad_x = TensorState(
+            name=f"grad_{self.x}",
+            global_shape=x.global_shape,
+            local_shape=x.local_shape,
+            sharding=x.sharding,
+            dtype=x.dtype,
+            expr=f"dropout_grad({x.expr}, p={self.p})",
+        )
+        return {self.x: grad_x}
+
+    def clone_with_names(self, input_map, output_name):
+        return Dropout(x=input_map.get(self.x, self.x), output=output_name, p=self.p)
+
+    def __repr__(self):
+        return f"Dropout({self.x}, p={self.p}) -> {self.output}"
+
+
+@dataclass
+class LayerNorm(IROp):
+    """LayerNorm: normalize across norm_dim.
+
+    If the input is sharded along norm_dim, raises an error because
+    normalization requires the full dimension for correct statistics.
+    """
+    x: str
+    output: str
+    norm_dim: int = -1
+
+    @property
+    def input_names(self) -> List[str]:
+        return [self.x]
+
+    @property
+    def output_name(self) -> str:
+        return self.output
+
+    def propagate_spmd_type(self, input_types):
+        return input_types.get(self.x)
+
+    def apply(self, ctx: Dict[str, TensorState]) -> TensorState:
+        x = ctx[self.x]
+        effective_dim = self.norm_dim if self.norm_dim >= 0 else len(x.global_shape) + self.norm_dim
+
+        for p in x.sharding.placements:
+            if isinstance(p, Shard) and p.dim == effective_dim:
+                raise ValueError(
+                    f"LayerNorm: input '{x.name}' is sharded on norm_dim={effective_dim}. "
+                    f"Normalization requires the full dimension for correct statistics. "
+                    f"Insert AllGather before LayerNorm or use a different sharding. "
+                    f"Op: LayerNorm({self.x}) -> {self.output}"
+                )
+
+        result = TensorState(
+            name=self.output,
+            global_shape=x.global_shape,
+            local_shape=x.local_shape,
+            sharding=x.sharding,
+            dtype=x.dtype,
+            expr=f"layernorm({x.expr})" if x.expr else "",
+            requires_grad=x.requires_grad,
+            grad_name=f"grad_{self.output}",
+        )
+        ctx[self.output] = result
+        return result
+
+    def vjp(self, ctx, grad_output):
+        x = ctx[self.x]
+        grad_x = TensorState(
+            name=f"grad_{self.x}",
+            global_shape=x.global_shape,
+            local_shape=x.local_shape,
+            sharding=x.sharding,
+            dtype=x.dtype,
+            expr=f"layernorm_grad({x.expr})",
+        )
+        return {self.x: grad_x}
+
+    def clone_with_names(self, input_map, output_name):
+        return LayerNorm(
+            x=input_map.get(self.x, self.x), output=output_name, norm_dim=self.norm_dim,
+        )
+
+    def __repr__(self):
+        return f"LayerNorm({self.x}, dim={self.norm_dim}) -> {self.output}"
+
+
+@dataclass
+class RMSNorm(IROp):
+    """RMSNorm: root-mean-square normalization across norm_dim.
+
+    Same sharding constraint as LayerNorm: norm_dim must not be sharded.
+    """
+    x: str
+    output: str
+    norm_dim: int = -1
+
+    @property
+    def input_names(self) -> List[str]:
+        return [self.x]
+
+    @property
+    def output_name(self) -> str:
+        return self.output
+
+    def propagate_spmd_type(self, input_types):
+        return input_types.get(self.x)
+
+    def apply(self, ctx: Dict[str, TensorState]) -> TensorState:
+        x = ctx[self.x]
+        effective_dim = self.norm_dim if self.norm_dim >= 0 else len(x.global_shape) + self.norm_dim
+
+        for p in x.sharding.placements:
+            if isinstance(p, Shard) and p.dim == effective_dim:
+                raise ValueError(
+                    f"RMSNorm: input '{x.name}' is sharded on norm_dim={effective_dim}. "
+                    f"Normalization requires the full dimension for correct statistics. "
+                    f"Insert AllGather before RMSNorm or use a different sharding. "
+                    f"Op: RMSNorm({self.x}) -> {self.output}"
+                )
+
+        result = TensorState(
+            name=self.output,
+            global_shape=x.global_shape,
+            local_shape=x.local_shape,
+            sharding=x.sharding,
+            dtype=x.dtype,
+            expr=f"rmsnorm({x.expr})" if x.expr else "",
+            requires_grad=x.requires_grad,
+            grad_name=f"grad_{self.output}",
+        )
+        ctx[self.output] = result
+        return result
+
+    def vjp(self, ctx, grad_output):
+        x = ctx[self.x]
+        grad_x = TensorState(
+            name=f"grad_{self.x}",
+            global_shape=x.global_shape,
+            local_shape=x.local_shape,
+            sharding=x.sharding,
+            dtype=x.dtype,
+            expr=f"rmsnorm_grad({x.expr})",
+        )
+        return {self.x: grad_x}
+
+    def clone_with_names(self, input_map, output_name):
+        return RMSNorm(
+            x=input_map.get(self.x, self.x), output=output_name, norm_dim=self.norm_dim,
+        )
+
+    def __repr__(self):
+        return f"RMSNorm({self.x}, dim={self.norm_dim}) -> {self.output}"
+
+
+@dataclass
+class Softmax(IROp):
+    """Softmax: normalize along reduction_dim.
+
+    Same constraint as LayerNorm: reduction_dim must not be sharded.
+    """
+    x: str
+    output: str
+    dim: int = -1
+
+    @property
+    def input_names(self) -> List[str]:
+        return [self.x]
+
+    @property
+    def output_name(self) -> str:
+        return self.output
+
+    def propagate_spmd_type(self, input_types):
+        return input_types.get(self.x)
+
+    def apply(self, ctx: Dict[str, TensorState]) -> TensorState:
+        x = ctx[self.x]
+        effective_dim = self.dim if self.dim >= 0 else len(x.global_shape) + self.dim
+
+        for p in x.sharding.placements:
+            if isinstance(p, Shard) and p.dim == effective_dim:
+                raise ValueError(
+                    f"Softmax: input '{x.name}' is sharded on dim={effective_dim}. "
+                    f"Softmax requires the full dimension for correct normalization. "
+                    f"Insert AllGather before Softmax or use a different sharding. "
+                    f"Op: Softmax({self.x}) -> {self.output}"
+                )
+
+        result = TensorState(
+            name=self.output,
+            global_shape=x.global_shape,
+            local_shape=x.local_shape,
+            sharding=x.sharding,
+            dtype=x.dtype,
+            expr=f"softmax({x.expr})" if x.expr else "",
+            requires_grad=x.requires_grad,
+            grad_name=f"grad_{self.output}",
+        )
+        ctx[self.output] = result
+        return result
+
+    def vjp(self, ctx, grad_output):
+        x = ctx[self.x]
+        grad_x = TensorState(
+            name=f"grad_{self.x}",
+            global_shape=x.global_shape,
+            local_shape=x.local_shape,
+            sharding=x.sharding,
+            dtype=x.dtype,
+            expr=f"softmax_grad({x.expr})",
+        )
+        return {self.x: grad_x}
+
+    def clone_with_names(self, input_map, output_name):
+        return Softmax(x=input_map.get(self.x, self.x), output=output_name, dim=self.dim)
+
+    def __repr__(self):
+        return f"Softmax({self.x}, dim={self.dim}) -> {self.output}"
+
+
+@dataclass
+class Embedding(IROp):
+    """Embedding lookup: Y = W[indices].
+
+    Vocab-parallel sharding: when weight is Shard(0) on vocab dim,
+    each rank holds a slice of the vocabulary. After lookup, output
+    is Partial (needs AllReduce to combine rows from all ranks).
+    """
+    indices: str
+    weight: str
+    output: str
+    vocab_dim: int = 0
+
+    @property
+    def input_names(self) -> List[str]:
+        return [self.indices, self.weight]
+
+    @property
+    def output_name(self) -> str:
+        return self.output
+
+    def propagate_spmd_type(self, input_types):
+        w_type = input_types.get(self.weight)
+        if w_type == LocalSPMDType.VARYING:
+            return LocalSPMDType.PARTIAL
+        return w_type
+
+    def apply(self, ctx: Dict[str, TensorState]) -> TensorState:
+        indices = ctx[self.indices]
+        weight = ctx[self.weight]
+
+        out_global = indices.global_shape + (weight.global_shape[1],)
+
+        out_placements = []
+        for p in weight.sharding.placements:
+            if isinstance(p, Shard) and p.dim == self.vocab_dim:
+                out_placements.append(Partial())
+            else:
+                out_placements.append(p)
+
+        out_spec = ShardingSpec(placements=tuple(out_placements), mesh=weight.sharding.mesh)
+        out_local = compute_local_shape(out_global, out_spec)
+
+        result = TensorState(
+            name=self.output,
+            global_shape=out_global,
+            local_shape=out_local,
+            sharding=out_spec,
+            dtype=weight.dtype,
+            expr=f"embed({weight.expr}[{indices.expr}])" if weight.expr else "",
+            requires_grad=weight.requires_grad,
+            grad_name=f"grad_{self.output}",
+        )
+        ctx[self.output] = result
+        return result
+
+    def vjp(self, ctx, grad_output):
+        weight = ctx[self.weight]
+        grad_w = TensorState(
+            name=f"grad_{self.weight}",
+            global_shape=weight.global_shape,
+            local_shape=weight.local_shape,
+            sharding=weight.sharding,
+            dtype=weight.dtype,
+            expr=f"embed_grad({weight.expr})",
+        )
+        return {self.weight: grad_w}
+
+    def clone_with_names(self, input_map, output_name):
+        return Embedding(
+            indices=input_map.get(self.indices, self.indices),
+            weight=input_map.get(self.weight, self.weight),
+            output=output_name,
+            vocab_dim=self.vocab_dim,
+        )
+
+    def __repr__(self):
+        return f"Embedding({self.indices}, {self.weight}) -> {self.output}"
+
+
+@dataclass
+class CrossEntropyLoss(IROp):
+    """Cross-entropy loss: L = -sum(targets * log(softmax(logits))).
+
+    Vocab-parallel: when logits are Shard on vocab dim, the loss
+    computation requires communication. Output is a scalar with
+    Partial placement (needs AllReduce to get the full loss).
+    """
+    logits: str
+    targets: str
+    output: str
+    vocab_dim: int = -1
+
+    @property
+    def input_names(self) -> List[str]:
+        return [self.logits, self.targets]
+
+    @property
+    def output_name(self) -> str:
+        return self.output
+
+    def propagate_spmd_type(self, input_types):
+        l_type = input_types.get(self.logits)
+        if l_type == LocalSPMDType.VARYING:
+            return LocalSPMDType.PARTIAL
+        return l_type
+
+    def apply(self, ctx: Dict[str, TensorState]) -> TensorState:
+        logits = ctx[self.logits]
+        effective_dim = self.vocab_dim if self.vocab_dim >= 0 else len(logits.global_shape) + self.vocab_dim
+
+        out_global = (1,)
+
+        out_placements = []
+        vocab_sharded = False
+        for p in logits.sharding.placements:
+            if isinstance(p, Shard) and p.dim == effective_dim:
+                out_placements.append(Partial())
+                vocab_sharded = True
+            elif isinstance(p, Partial):
+                out_placements.append(Partial())
+            else:
+                out_placements.append(Replicate())
+
+        out_spec = ShardingSpec(placements=tuple(out_placements), mesh=logits.sharding.mesh)
+
+        result = TensorState(
+            name=self.output,
+            global_shape=out_global,
+            local_shape=out_global,
+            sharding=out_spec,
+            dtype=logits.dtype,
+            expr=f"cross_entropy({logits.expr})" if logits.expr else "",
+            requires_grad=logits.requires_grad,
+            grad_name=f"grad_{self.output}",
+        )
+        ctx[self.output] = result
+        return result
+
+    def vjp(self, ctx, grad_output):
+        logits = ctx[self.logits]
+        grad_logits = TensorState(
+            name=f"grad_{self.logits}",
+            global_shape=logits.global_shape,
+            local_shape=logits.local_shape,
+            sharding=logits.sharding,
+            dtype=logits.dtype,
+            expr=f"cross_entropy_grad({logits.expr})",
+        )
+        return {self.logits: grad_logits}
+
+    def clone_with_names(self, input_map, output_name):
+        return CrossEntropyLoss(
+            logits=input_map.get(self.logits, self.logits),
+            targets=input_map.get(self.targets, self.targets),
+            output=output_name,
+            vocab_dim=self.vocab_dim,
+        )
+
+    def __repr__(self):
+        return f"CrossEntropyLoss({self.logits}, {self.targets}) -> {self.output}"

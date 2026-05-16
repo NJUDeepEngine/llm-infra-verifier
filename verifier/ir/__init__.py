@@ -14,7 +14,15 @@ from .compute import (
     Add,
     Multiply,
     SiLU,
+    GELU,
+    ReLU,
+    Dropout,
+    LayerNorm,
+    RMSNorm,
+    Softmax,
     FlashAttention,
+    Embedding,
+    CrossEntropyLoss,
 )
 
 from .collective import (
@@ -96,7 +104,9 @@ __all__ = [
     # base
     "IROp", "SPMDConsistencyError",
     # compute
-    "ElementWiseBinaryOp", "MatMul", "Add", "Multiply", "SiLU", "FlashAttention",
+    "ElementWiseBinaryOp", "MatMul", "Add", "Multiply", "SiLU", "GELU", "ReLU",
+    "Dropout", "LayerNorm", "RMSNorm", "Softmax", "FlashAttention",
+    "Embedding", "CrossEntropyLoss",
     # collective
     "CollectiveOp", "AllReduce", "AllGather", "ReduceScatter",
     "Broadcast", "Reduce", "AllToAll", "Scatter", "Gather",

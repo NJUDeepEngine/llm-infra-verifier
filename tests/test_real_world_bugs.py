@@ -371,7 +371,9 @@ class TestFSDPOverlapDeadlock:
         prog.add(AllGather(x="param_next", output="param_full",
                             gather_dim=0))
 
-        result = blind_verify(prog, exe)
+        # grad_shard is intentionally sharded (consumed by optimizer),
+        # param_full is the real output that should be Replicate
+        result = blind_verify(prog, exe, output_names=["param_full"])
 
         # NOT CAUGHT: both ops execute correctly in sequence.
         assert result.spatial_passed

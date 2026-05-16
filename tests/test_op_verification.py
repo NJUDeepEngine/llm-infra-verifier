@@ -31,6 +31,14 @@ from verifier.ir import (
     ReduceScatter,
     Reshape,
     SiLU,
+    GELU,
+    ReLU,
+    Dropout,
+    LayerNorm,
+    RMSNorm,
+    Softmax,
+    Embedding,
+    CrossEntropyLoss,
     Program,
     ir_to_str,
     SPMDConsistencyError,
@@ -633,3 +641,242 @@ class TestComposedPipeline:
         assert "AllReduce" in text
         assert "[0]" in text
         assert "[1]" in text
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 7. New compute ops: activations, normalization, embedding, loss
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestNewComputeOps:
+    """Verify placement propagation and sharding constraints for new ops."""
+
+    # ── Element-wise activations ────────────────────────────────────────────
+
+    def test_gelu_preserves_placement(self):
+        mesh = make_mesh(tp=2)
+        x = make_tensor("x", (8, 4), Shard(dim=1), mesh)
+        ctx = {"x": x}
+        result = GELU(x="x", output="y").apply(ctx)
+        assert result.global_shape == (8, 4)
+        assert isinstance(result.sharding.placements[0], Shard)
+        assert result.sharding.placements[0].dim == 1
+
+    def test_relu_preserves_placement(self):
+        mesh = make_mesh(tp=2)
+        x = make_tensor("x", (8, 4), Replicate(), mesh)
+        ctx = {"x": x}
+        result = ReLU(x="x", output="y").apply(ctx)
+        assert isinstance(result.sharding.placements[0], Replicate)
+
+    def test_dropout_preserves_placement(self):
+        mesh = make_mesh(tp=2)
+        x = make_tensor("x", (8, 4), Partial(), mesh)
+        ctx = {"x": x}
+        result = Dropout(x="x", output="y", p=0.1).apply(ctx)
+        assert isinstance(result.sharding.placements[0], Partial)
+
+    def test_gelu_vjp(self):
+        mesh = make_mesh(tp=2)
+        x = make_tensor("x", (8, 4), Shard(dim=0), mesh)
+        ctx = {"x": x}
+        op = GELU(x="x", output="y")
+        op.apply(ctx)
+        grads = op.vjp(ctx, ctx["y"])
+        assert "x" in grads
+        assert grads["x"].sharding == x.sharding
+
+    # ── Normalization ops ───────────────────────────────────────────────────
+
+    def test_layernorm_replicate_ok(self):
+        mesh = make_mesh(tp=2)
+        x = make_tensor("x", (8, 128), Replicate(), mesh)
+        ctx = {"x": x}
+        result = LayerNorm(x="x", output="y", norm_dim=-1).apply(ctx)
+        assert result.global_shape == (8, 128)
+        assert isinstance(result.sharding.placements[0], Replicate)
+
+    def test_layernorm_batch_shard_ok(self):
+        mesh = make_mesh(tp=2)
+        x = make_tensor("x", (8, 128), Shard(dim=0), mesh)
+        ctx = {"x": x}
+        result = LayerNorm(x="x", output="y", norm_dim=1).apply(ctx)
+        assert isinstance(result.sharding.placements[0], Shard)
+
+    def test_layernorm_shard_on_norm_dim_error(self):
+        mesh = make_mesh(tp=2)
+        x = make_tensor("x", (8, 128), Shard(dim=1), mesh)
+        ctx = {"x": x}
+        with pytest.raises(ValueError, match="sharded on norm_dim"):
+            LayerNorm(x="x", output="y", norm_dim=1).apply(ctx)
+
+    def test_layernorm_negative_norm_dim_error(self):
+        mesh = make_mesh(tp=2)
+        x = make_tensor("x", (8, 128), Shard(dim=1), mesh)
+        ctx = {"x": x}
+        with pytest.raises(ValueError, match="sharded on norm_dim"):
+            LayerNorm(x="x", output="y", norm_dim=-1).apply(ctx)
+
+    def test_rmsnorm_shard_on_norm_dim_error(self):
+        mesh = make_mesh(tp=2)
+        x = make_tensor("x", (8, 128), Shard(dim=1), mesh)
+        ctx = {"x": x}
+        with pytest.raises(ValueError, match="sharded on norm_dim"):
+            RMSNorm(x="x", output="y", norm_dim=-1).apply(ctx)
+
+    def test_rmsnorm_batch_shard_ok(self):
+        mesh = make_mesh(tp=2)
+        x = make_tensor("x", (8, 128), Shard(dim=0), mesh)
+        ctx = {"x": x}
+        result = RMSNorm(x="x", output="y", norm_dim=-1).apply(ctx)
+        assert isinstance(result.sharding.placements[0], Shard)
+
+    def test_softmax_replicate_ok(self):
+        mesh = make_mesh(tp=2)
+        x = make_tensor("x", (8, 128), Replicate(), mesh)
+        ctx = {"x": x}
+        result = Softmax(x="x", output="y", dim=-1).apply(ctx)
+        assert isinstance(result.sharding.placements[0], Replicate)
+
+    def test_softmax_shard_on_reduction_dim_error(self):
+        mesh = make_mesh(tp=2)
+        x = make_tensor("x", (8, 128), Shard(dim=1), mesh)
+        ctx = {"x": x}
+        with pytest.raises(ValueError, match="sharded on dim"):
+            Softmax(x="x", output="y", dim=-1).apply(ctx)
+
+    # ── Vocab-parallel ops ──────────────────────────────────────────────────
+
+    def test_embedding_replicate_weight(self):
+        mesh = make_mesh(tp=2)
+        indices = make_tensor("ids", (32,), Replicate(), mesh)
+        weight = make_tensor("W_emb", (50000, 128), Replicate(), mesh)
+        ctx = {"ids": indices, "W_emb": weight}
+        result = Embedding(indices="ids", weight="W_emb", output="emb").apply(ctx)
+        assert result.global_shape == (32, 128)
+        assert isinstance(result.sharding.placements[0], Replicate)
+
+    def test_embedding_vocab_parallel(self):
+        mesh = make_mesh(tp=2)
+        indices = make_tensor("ids", (32,), Replicate(), mesh)
+        weight = make_tensor("W_emb", (50000, 128), Shard(dim=0), mesh)
+        ctx = {"ids": indices, "W_emb": weight}
+        result = Embedding(indices="ids", weight="W_emb", output="emb").apply(ctx)
+        assert result.global_shape == (32, 128)
+        assert isinstance(result.sharding.placements[0], Partial)
+
+    def test_embedding_vjp(self):
+        mesh = make_mesh(tp=2)
+        indices = make_tensor("ids", (32,), Replicate(), mesh)
+        weight = make_tensor("W_emb", (50000, 128), Shard(dim=0), mesh)
+        ctx = {"ids": indices, "W_emb": weight}
+        op = Embedding(indices="ids", weight="W_emb", output="emb")
+        op.apply(ctx)
+        grads = op.vjp(ctx, ctx["emb"])
+        assert "W_emb" in grads
+        assert grads["W_emb"].sharding == weight.sharding
+
+    def test_cross_entropy_replicate_logits(self):
+        mesh = make_mesh(tp=2)
+        logits = make_tensor("logits", (32, 50000), Replicate(), mesh)
+        targets = make_tensor("targets", (32,), Replicate(), mesh)
+        ctx = {"logits": logits, "targets": targets}
+        result = CrossEntropyLoss(
+            logits="logits", targets="targets", output="loss",
+        ).apply(ctx)
+        assert result.global_shape == (1,)
+        assert isinstance(result.sharding.placements[0], Replicate)
+
+    def test_cross_entropy_vocab_parallel(self):
+        mesh = make_mesh(tp=2)
+        logits = make_tensor("logits", (32, 50000), Shard(dim=1), mesh)
+        targets = make_tensor("targets", (32,), Replicate(), mesh)
+        ctx = {"logits": logits, "targets": targets}
+        result = CrossEntropyLoss(
+            logits="logits", targets="targets", output="loss", vocab_dim=-1,
+        ).apply(ctx)
+        assert result.global_shape == (1,)
+        assert isinstance(result.sharding.placements[0], Partial)
+
+    def test_cross_entropy_vjp(self):
+        mesh = make_mesh(tp=2)
+        logits = make_tensor("logits", (32, 50000), Shard(dim=1), mesh)
+        targets = make_tensor("targets", (32,), Replicate(), mesh)
+        ctx = {"logits": logits, "targets": targets}
+        op = CrossEntropyLoss(
+            logits="logits", targets="targets", output="loss",
+        )
+        op.apply(ctx)
+        grads = op.vjp(ctx, ctx["loss"])
+        assert "logits" in grads
+        assert grads["logits"].sharding == logits.sharding
+
+    # ── Clone / repr coverage ───────────────────────────────────────────────
+
+    def test_clone_with_names(self):
+        op = LayerNorm(x="x", output="y", norm_dim=-1)
+        cloned = op.clone_with_names({"x": "a"}, "b")
+        assert cloned.x == "a"
+        assert cloned.output == "b"
+        assert cloned.norm_dim == -1
+
+    def test_repr_all_new_ops(self):
+        ops = [
+            GELU(x="x", output="y"),
+            ReLU(x="x", output="y"),
+            Dropout(x="x", output="y", p=0.1),
+            LayerNorm(x="x", output="y"),
+            RMSNorm(x="x", output="y"),
+            Softmax(x="x", output="y"),
+            Embedding(indices="ids", weight="W", output="emb"),
+            CrossEntropyLoss(logits="l", targets="t", output="loss"),
+        ]
+        for op in ops:
+            r = repr(op)
+            assert type(op).__name__ in r
+
+    # ── Multi-device execution ──────────────────────────────────────────────
+
+    def test_executor_gelu_layernorm(self):
+        mesh = make_mesh(tp=2)
+        executor = MultiDeviceExecutor(mesh=mesh)
+
+        x_spec = ShardingSpec(placements=(Shard(dim=0),), mesh=mesh)
+        x = TensorState(
+            name="x", global_shape=(8, 128),
+            local_shape=compute_local_shape((8, 128), x_spec),
+            sharding=x_spec, expr="x", requires_grad=True,
+        )
+        executor.register_tensor(x)
+
+        program = Program("test_new_ops", ops=[
+            GELU(x="x", output="h"),
+            LayerNorm(x="h", output="y", norm_dim=-1),
+        ])
+        final = executor.run_program(program)
+        assert final["y"].global_shape == (8, 128)
+        assert isinstance(final["y"].sharding.placements[0], Shard)
+
+    def test_executor_embedding_allreduce(self):
+        mesh = make_mesh(tp=2)
+        executor = MultiDeviceExecutor(mesh=mesh)
+
+        ids_spec = ShardingSpec(placements=(Replicate(),), mesh=mesh)
+        ids = TensorState(
+            name="ids", global_shape=(32,),
+            local_shape=(32,), sharding=ids_spec, expr="ids",
+        )
+        w_spec = ShardingSpec(placements=(Shard(dim=0),), mesh=mesh)
+        w = TensorState(
+            name="W", global_shape=(50000, 128),
+            local_shape=compute_local_shape((50000, 128), w_spec),
+            sharding=w_spec, expr="W", requires_grad=True,
+        )
+        executor.register_tensor(ids)
+        executor.register_tensor(w)
+
+        program = Program("vocab_parallel_embed", ops=[
+            Embedding(indices="ids", weight="W", output="emb_partial"),
+            AllReduce(x="emb_partial", output="emb"),
+        ])
+        final = executor.run_program(program)
+        assert isinstance(final["emb"].sharding.placements[0], Replicate)
