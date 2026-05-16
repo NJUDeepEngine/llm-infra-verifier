@@ -37,6 +37,11 @@ from .ir import (
     Add,
     Multiply,
     SiLU,
+    GELU,
+    ReLU,
+    Dropout,
+    LayerNorm,
+    RMSNorm,
     AllReduce,
     AllGather,
     ReduceScatter,
@@ -399,9 +404,20 @@ class TIRLifter:
             x_name = block.reads[0].buffer
             y_name = block.writes[0].buffer
 
-            # Check for SiLU
-            if "silu" in (block.body or "").lower():
+            # Check for activation functions
+            body_lower = (block.body or "").lower()
+            if "silu" in body_lower:
                 op = SiLU(x=x_name, output=y_name)
+            elif "gelu" in body_lower:
+                op = GELU(x=x_name, output=y_name)
+            elif "relu" in body_lower:
+                op = ReLU(x=x_name, output=y_name)
+            elif "dropout" in body_lower:
+                op = Dropout(x=x_name, output=y_name)
+            elif "layernorm" in body_lower or "layer_norm" in body_lower:
+                op = LayerNorm(x=x_name, output=y_name)
+            elif "rmsnorm" in body_lower or "rms_norm" in body_lower:
+                op = RMSNorm(x=x_name, output=y_name)
             else:
                 # Generic unary
                 op = Multiply(a=x_name, b=x_name, output=y_name)  # fallback
@@ -638,7 +654,8 @@ class TIRLifter:
                     )
                 )
 
-            elif isinstance(op, (Add, Multiply, SiLU)):
+            elif isinstance(op, (Add, Multiply, SiLU, GELU, ReLU, Dropout,
+                                  LayerNorm, RMSNorm)):
                 # Element-wise: grad flows through
                 for input_name in op.input_names:
                     bwd_program.add(

@@ -34,6 +34,14 @@ from .ir import (
     Add,
     Multiply,
     SiLU,
+    GELU,
+    ReLU,
+    Dropout,
+    LayerNorm,
+    RMSNorm,
+    Softmax,
+    Embedding,
+    CrossEntropyLoss,
     AllReduce,
     AllGather,
     ReduceScatter,
@@ -209,6 +217,20 @@ class Z3PlacementSolver:
         q, y = self._var(op.q), self._var(op.output)
         self.solver.add(y == q)
 
+    def _encode_embedding(self, op):
+        """Embedding: weight Shard(0) -> Partial, otherwise passthrough."""
+        w, y = self._var(op.weight), self._var(op.output)
+        self.solver.add(y == If(w == IntVal(PL_S0), IntVal(PL_P), w))
+
+    def _encode_cross_entropy(self, op):
+        """CrossEntropyLoss: logits Shard(vocab) -> Partial, else Replicate."""
+        x, y = self._var(op.logits), self._var(op.output)
+        self.solver.add(y == If(
+            Or(x == IntVal(PL_S0), x == IntVal(PL_S1), x == IntVal(PL_P)),
+            IntVal(PL_P),
+            IntVal(PL_R),
+        ))
+
     def encode_program(self, program: Program):
         """Walk all ops and add Z3 constraints for placement propagation."""
         for op in program.ops:
@@ -234,11 +256,17 @@ class Z3PlacementSolver:
                 y = self._var(op.output)
                 sd = op.scatter_dim
                 self.solver.add(y == IntVal(PL_S0 if sd == 0 else PL_S1))
-            elif isinstance(op, (SiLU, Reshape, Transpose, Cast, LossScale,
+            elif isinstance(op, (SiLU, GELU, ReLU, Dropout,
+                                 LayerNorm, RMSNorm, Softmax,
+                                 Reshape, Transpose, Cast, LossScale,
                                  FP8Quantize, FP8Dequantize,
                                  Reinterpret, Convert,
                                  RingAttentionStep, ExpertCompute)):
                 self._encode_passthrough(op)
+            elif isinstance(op, Embedding):
+                self._encode_embedding(op)
+            elif isinstance(op, CrossEntropyLoss):
+                self._encode_cross_entropy(op)
             elif isinstance(op, (OverlapRegion,)):
                 for sub in op.compute_ops + op.comm_ops:
                     self._encode_op_single(sub)
@@ -591,10 +619,27 @@ class Z3PlacementSolver:
                         self.solver.add(gs_y[d] == gs_x[d])
                     self.solver.add(ls_y[d] == gs_y[d])
 
-            elif isinstance(op, (SiLU, Cast, LossScale, Reshape, Transpose,
+            elif isinstance(op, (SiLU, GELU, ReLU, Dropout,
+                                 LayerNorm, RMSNorm, Softmax,
+                                 Cast, LossScale, Reshape, Transpose,
                                  FP8Quantize, FP8Dequantize,
                                  Reinterpret, Convert)):
                 self._encode_shape_passthrough(op, tp)
+
+            elif isinstance(op, Embedding):
+                if op.weight not in self._shape_vars:
+                    continue
+                gs_w = self._shape_vars[op.weight]
+                gs_y, ls_y = self._shape_var(op.output)
+                pl_y = self._var(op.output)
+                if len(gs_w) >= 2:
+                    self.solver.add(gs_y[1] == gs_w[1])
+                self._add_local_shape_constraints(gs_y, ls_y, pl_y, tp)
+
+            elif isinstance(op, CrossEntropyLoss):
+                gs_y, ls_y = self._shape_var(op.output)
+                self.solver.add(gs_y[0] == IntVal(1))
+                self.solver.add(ls_y[0] == IntVal(1))
 
     def check_shape_consistency(self) -> List[VerifyResult]:
         """Check all shape constraints. SAT means a violation exists."""
