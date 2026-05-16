@@ -7,108 +7,78 @@ permalink: /
 # LLM-Infra-Verifier
 
 {: .fs-8 }
-Formal verification for distributed tensor programs — ensuring correctness of Tensor Parallelism, Pipeline Parallelism, and Context Parallelism.
+Static verification framework for distributed LLM training — catches placement bugs and communication races at compile time.
 
 {: .fs-5 }
-Built on **Z3 SMT solver** + **symbolic execution** + **Happens-Before temporal analysis**, targeting TileLang TIR and Megatron-LM as verification sources.
+Built on **Z3 SMT solver** + **symbolic execution** + **Happens-Before temporal analysis**. 48 IR ops, 10 verification checks, 531 tests. Zero GPU required.
 
 [Get Started](getting-started){: .btn .btn-primary .fs-5 .mb-4 .mb-md-0 .mr-2 }
 [View on GitHub](https://github.com/NJUDeepEngine/llm-infra-verifier){: .btn .fs-5 .mb-4 .mb-md-0 }
 
 ---
 
-## Why this exists
+## Why This Exists
 
-Distributed training programs are notoriously hard to get right. Bugs like **missing AllReduce**, **GELU applied to sharded tensors**, or **async communication races** produce numerically incorrect results that pass unit tests but fail in production at scale.
+Distributed training bugs are silent, intermittent, and catastrophic at scale:
 
-`llm-infra-verifier` catches these bugs **at compile time**, before you ever launch a distributed job.
+| Bug Type | Symptom | Traditional Detection |
+|----------|---------|----------------------|
+| Missing AllReduce after row-parallel MatMul | Silently diverging weights | Compare against single-GPU baseline |
+| LayerNorm on sharded hidden dim | Incorrect normalization statistics | Check mathematical equivalence |
+| Async AllReduce without Wait | Race condition | Flaky, CI-unfriendly |
+| Mismatched Send/Recv in pipeline | Deadlock at specific scale | Only surfaces in production |
 
-### Two dimensions of verification
-
-| | Spatial | Temporal |
-|---|---|---|
-| **What** | Placement propagation, postconditions, gradient duality | Data races, missing waits, buffer aliasing |
-| **How** | Z3 SMT + symbolic execution | Happens-Before graph + Z3 constraints |
-| **Bugs caught** | Missing AllReduce, wrong placement, gradient inconsistencies | Async read before Wait, concurrent buffer writes |
-| **Example** | RowParallel without AllReduce → PARTIAL output | `AllReduceAsync` + `MatMul` on same buffer without `Wait` |
-
-### Real-code validation
-
-Every verification capability is validated against **actual implementations**:
-
-| Source | Module | Reference |
-|---|---|---|
-| Megatron-LM | `ColumnParallelLinear`, `RowParallelLinear` | `megatron/core/tensor_parallel/layers.py` |
-| Megatron-LM | Async gradient AllReduce | `LinearWithGradAccumulationAndAsyncCommunication` |
-| Megatron-LM | TP MLP, Sequence Parallel + TP | `megatron_mlp.py`, `layers.py` |
-| PyTorch | GELU-between-CP-and-RP bug | `pytorch/pytorch#144359` |
-| TileLang | TIR block → distributed IR lifting | `examples/gemm/example_gemm.py` |
+**This verifier catches them all statically — in milliseconds, with zero GPUs.**
 
 ---
 
-## Project status
+## Two-Dimensional Verification
 
-| Metric | Value |
-|---|---|
-| Tests | 42 (all passing) |
-| Benchmark cases | 35 (100% detection) |
-| Verification dimensions | Spatial (6 checks) + Temporal (4 checks) |
-| Parallelism types | TP, PP, CP (forward + backward) |
+| | Spatial (6 checks) | Temporal (4 checks) |
+|---|---|---|
+| **Question** | Where does each tensor go? | When do things happen? |
+| **Method** | Z3 SMT + symbolic execution | Happens-Before graph + Z3 |
+| **Bugs caught** | Missing collectives, wrong placement, gradient inconsistencies | Races, missing waits, buffer aliasing |
 
 ---
 
-## Quick overview
+## Quick Overview
 
 ```python
 from verifier import *
 
-# Row Parallel Linear: both operands sharded on reduce dim
 mesh = DeviceMesh(shape=(2,), dim_names=("tp",))
-x = TensorState("x", (8, 16), (8, 8),
-    ShardingSpec((Shard(dim=1),), mesh))
-w = TensorState("w", (16, 32), (8, 32),
-    ShardingSpec((Shard(dim=0),), mesh))
+x_spec = ShardingSpec(placements=(Shard(dim=1),), mesh=mesh)
+w_spec = ShardingSpec(placements=(Shard(dim=0),), mesh=mesh)
 
-# Verify: MatMul → AllReduce produces Replicate output
-fwd = Program("tp_linear")
-fwd.add(MatMul(a="x", b="w", output="y_partial"))
-fwd.add(AllReduce(x="y_partial", output="y"))
+x = TensorState("x", (8, 16), compute_local_shape((8, 16), x_spec), x_spec, expr="x")
+w = TensorState("w", (16, 32), compute_local_shape((16, 32), w_spec), w_spec, expr="w")
 
-executor = MultiDeviceExecutor(mesh)
-executor.register_tensor(x); executor.register_tensor(w)
-state = executor.run_program(fwd)
+program = Program("tp_linear", ops=[
+    MatMul(a="x", b="w", output="y_partial"),
+    AllReduce(x="y_partial", output="y"),
+])
+
+executor = MultiDeviceExecutor(mesh=mesh)
+executor.register_tensor(x)
+executor.register_tensor(w)
+final = executor.run_program(program)
 
 verifier = DistributedVerifier()
-result = verifier.verify_postcondition(state["y"], expected_partial=False)
-# PASSED — y is Replicate, not Partial
+results = verifier.verify_all(program, final)
+print(verifier.summary())
+# Verification Summary: 4 passed, 0 failed
 ```
 
-### Temporal verification
+---
 
-```python
-from verifier.temporal import verify_temporal
+## Project Status
 
-prog = Program("overlap_bug")
-prog.add(MatMul("x", "w", "y_partial"))
-prog.add(AllReduceAsync("y_partial", "y", handle="h1", stream=COMM_STREAM))
-prog.add(MatMul("y", "w2", "z"))  # BUG: reads async output before Wait!
-
-result = verify_temporal(prog)
-# Detected: MISSING_WAIT — MatMul reads 'y' before Wait(h1)
-```
-
-### Verified parallelization synthesis
-
-```python
-from verifier.synthesis import synthesize_parallel_program
-
-result = synthesize_parallel_program(
-    compute_ops=[MatMul(a="x", b="w", output="y")],
-    input_shapes={"x": (8, 16), "w": (16, 32)},
-    sharding_specs={
-        "x": ShardingSpec((Shard(dim=1),), mesh),
-        "w": ShardingSpec((Shard(dim=0),), mesh),
-    },
-)
-# Auto-synthesizes: MatMul → AllReduce → y_reduced
-```
+| Metric | Value |
+|--------|-------|
+| IR Operations | 48 (compute, collective, P2P, async, shape, precision, ZeRO, CP, MoE) |
+| Verification Checks | 10 (6 spatial + 4 temporal) |
+| Tests | 531 (all passing) |
+| Examples | 9 runnable demos |
+| Dependencies | 2 (z3-solver, pytest) |
+| Parallelism Coverage | TP, PP, CP, DP, ZeRO, MoE, FP8 |

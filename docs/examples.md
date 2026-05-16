@@ -5,7 +5,7 @@ nav_order: 6
 
 # Examples & Demos
 
-All examples are runnable from the `examples/` directory.
+All 9 examples are runnable from the `examples/` directory.
 
 ## Spatial Verification
 
@@ -13,7 +13,7 @@ All examples are runnable from the `examples/` directory.
 
 Two cases:
 1. **Correct:** Row Parallel with `MatMul → AllReduce` — passes verification
-2. **Bug:** Missing AllReduce — output remains PARTIAL, **detected**
+2. **Bug:** Missing AllReduce — output remains Partial, **detected**
 
 ```bash
 python examples/tp_linear.py
@@ -25,7 +25,7 @@ Megatron-style MLP with Column Parallel (gate, up) + Row Parallel (down):
 
 - Column Parallel produces Shard(1) — **no forward communication**
 - Row Parallel needs AllReduce — **1 collective in forward**
-- Element-wise ops preserve sharding
+- Element-wise ops (SiLU, GELU) preserve sharding
 
 ```bash
 python examples/tp_mlp.py
@@ -71,20 +71,25 @@ Five cases demonstrating temporal bug detection:
 python examples/overlap_demo.py
 ```
 
-### Expected output (case 5 — correct):
+## SPMD Type System
 
-```
-Temporal Verification: SAFE
-  Ops: 5 total, 1 async
-  HB edges: 7
-  Violations: 0
+### SPMD Demo (`spmd_demo.py`)
+
+Demonstrates the R/I/V/P SPMD type system:
+- Type propagation through compute ops
+- Gradient duality verification (R↔P, I↔I, V↔V)
+- SPMDGuard assertion checking
+- Forbidden operations (Partial × Partial)
+
+```bash
+python examples/spmd_demo.py
 ```
 
 ## Synthesis & LLM Frontend
 
 ### Synthesis Demo (`synthesis_demo.py`)
 
-Demonstrates the full "Verified Parallelization Synthesis" pipeline:
+Full "Verified Parallelization Synthesis" pipeline:
 
 1. **Input:** compute-only program + sharding spec
 2. **Analysis:** find Partial tensors, propose tactics
@@ -99,16 +104,33 @@ Also demonstrates the LLM frontend:
 python examples/synthesis_demo.py
 ```
 
-### Synthesis result example:
+## End-to-End Verification
 
-```
-Row Parallel synthesis:  SUCCESS
-  Best program: MatMul(x, w) → y  +  AllReduce(y) → y_reduced
-  Cost: AR=1 (total=2)
-  Final verification: PASSED
+### Megatron GPT-2 (`megatron_gpt2_verify.py`)
+
+Full Megatron-style GPT-2 layer verification:
+- Vocab-parallel Embedding with AllReduce
+- Tensor-parallel self-attention (Column + Row parallel)
+- Tensor-parallel MLP (SiLU gate, up/down projections)
+- LayerNorm placement checking
+- Complete forward + backward gradient duality
+
+```bash
+python examples/megatron_gpt2_verify.py
 ```
 
-## Usage in your own code
+### Consistency Demo (`consistency_demo.py`)
+
+Single-GPU equivalence proof:
+- Shows that distributed program produces same results as single-GPU
+- Symbolic expression comparison after collective resolution
+- Validates that AllReduce/AllGather properly reconstruct full tensors
+
+```bash
+python examples/consistency_demo.py
+```
+
+## Usage in Your Own Code
 
 ```python
 from verifier import *
@@ -116,13 +138,17 @@ from verifier.temporal import verify_temporal
 
 # 1. Define device mesh and tensor states
 mesh = DeviceMesh(shape=(4,), dim_names=("tp",))
-x = TensorState("x", (B, H), (B, H//4),
-    ShardingSpec((Shard(dim=1),), mesh), requires_grad=True)
+spec = ShardingSpec(placements=(Shard(dim=1),), mesh=mesh)
+x = TensorState("x", (B, H), compute_local_shape((B, H), spec),
+    spec, requires_grad=True, expr="x")
 
 # 2. Build IR program
-prog = Program("my_layer")
-prog.add(MatMul("x", "w", "y_partial"))
-prog.add(AllReduce("y_partial", "y"))
+prog = Program("my_layer", ops=[
+    MatMul(a="x", b="w", output="y_partial"),
+    AllReduce(x="y_partial", output="y"),
+    LayerNorm(x="y", output="y_norm", norm_dim=-1),
+    SiLU(x="y_norm", output="y_act"),
+])
 
 # 3. Execute + verify spatial
 executor = MultiDeviceExecutor(mesh)
@@ -130,11 +156,17 @@ executor.register_tensor(x)
 state = executor.run_program(prog)
 
 verifier = DistributedVerifier()
-verifier.verify_all(prog, state)
+results = verifier.verify_all(prog, state)
+print(verifier.summary())
 
-# 4. Verify temporal (if async ops)
+# 4. Verify temporal (if async ops present)
 temporal_result = verify_temporal(prog)
 if not temporal_result.is_safe:
     for report in temporal_result.reports:
         print(f"VIOLATION: {report.race_type.value} — {report.description}")
+
+# 5. Generate backward + check gradient duality
+autograd = AutogradEngine()
+bwd = autograd.generate_backward("y_act")
+check = autograd.verify_gradient_correctness(prog, bwd)
 ```
