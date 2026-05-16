@@ -80,6 +80,7 @@ class RaceType(Enum):
     MISSING_WAIT = "missing_wait"
     BUFFER_ALIASING = "buffer_aliasing"
     DEPENDENCY_VIOLATION = "dependency_violation"
+    CONCURRENT_COLLECTIVES = "concurrent_collectives"
 
 
 @dataclass
@@ -331,6 +332,7 @@ class RaceDetector:
         self.detect_missing_waits()
         self.detect_buffer_aliasing()
         self.detect_dependency_violations()
+        self.detect_concurrent_collectives()
         return self.reports
 
     def _is_sync_op(self, event: TemporalEvent) -> bool:
@@ -514,6 +516,45 @@ class RaceDetector:
                             ),
                         ))
 
+    def detect_concurrent_collectives(self):
+        """Detect concurrent collective operations that may deadlock.
+
+        NCCL requires that collectives on overlapping process groups are
+        ordered across all ranks. Two collectives in an OverlapRegion
+        (intended for different streams) risk deadlock if they share ranks.
+
+        This is a general NCCL safety rule, not specific to any bug.
+        """
+        for i, event in enumerate(self.graph.events):
+            if not isinstance(event.op, OverlapRegion):
+                continue
+
+            compute_collectives = [
+                op for op in event.op.compute_ops if op.is_collective()
+            ]
+            comm_collectives = [
+                op for op in event.op.comm_ops if op.is_collective()
+            ]
+
+            if not compute_collectives or not comm_collectives:
+                continue
+
+            for c_op in compute_collectives:
+                for m_op in comm_collectives:
+                    self.reports.append(RaceReport(
+                        race_type=RaceType.CONCURRENT_COLLECTIVES,
+                        description=(
+                            f"Concurrent collectives in OverlapRegion: "
+                            f"{type(c_op).__name__} and {type(m_op).__name__}"
+                        ),
+                        op_a_idx=i, op_b_idx=i,
+                        details=(
+                            f"Compute stream: {c_op}, Comm stream: {m_op}. "
+                            f"NCCL collectives on different streams sharing ranks "
+                            f"must be serialized to avoid deadlock."
+                        ),
+                    ))
+
     def summary(self) -> str:
         if not self.reports:
             return "No temporal violations detected."
@@ -551,6 +592,10 @@ class TemporalVerifyResult:
     def num_dep_violations(self) -> int:
         return sum(1 for r in self.reports if r.race_type == RaceType.DEPENDENCY_VIOLATION)
 
+    @property
+    def num_concurrent_collectives(self) -> int:
+        return sum(1 for r in self.reports if r.race_type == RaceType.CONCURRENT_COLLECTIVES)
+
     def summary(self) -> str:
         status = "SAFE" if self.is_safe else "UNSAFE"
         lines = [
@@ -567,6 +612,8 @@ class TemporalVerifyResult:
             lines.append(f"    Buffer aliasing: {self.num_buffer_aliases}")
         if self.num_dep_violations:
             lines.append(f"    Dependency violations: {self.num_dep_violations}")
+        if self.num_concurrent_collectives:
+            lines.append(f"    Concurrent collectives: {self.num_concurrent_collectives}")
         for r in self.reports:
             lines.append(f"\n  {r}")
         return "\n".join(lines)

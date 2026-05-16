@@ -1000,7 +1000,7 @@ class DistributedVerifier:
             self.verify_gradient_duality(program, bwd_program)
 
         # 4. Placement consistency
-        self.verify_placement_consistency(program)
+        self.verify_placement_consistency(program, final_tensors=final_tensors)
 
         # 5. Shape consistency
         if initial_shapes:
