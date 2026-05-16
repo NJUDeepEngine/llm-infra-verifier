@@ -190,14 +190,36 @@ class Z3PlacementSolver:
                             P))))))))
 
     def _encode_elementwise(self, op):
-        R = IntVal(PL_R)
+        R, P = IntVal(PL_R), IntVal(PL_P)
         a, b, y = self._var(op.a), self._var(op.b), self._var(op.output)
         self.solver.add(y == If(a == R, b, If(b == R, a, a)))
+        self.solver.add(Not(And(a == P, b == P)))
 
     def _encode_passthrough(self, op):
         x_name = op.input_names[0]
         x, y = self._var(x_name), self._var(op.output_name)
         self.solver.add(y == x)
+
+    def _encode_norm_op(self, op, norm_dim: int):
+        """Encode norm op: output == input, with forbidden Shard(norm_dim) constraint."""
+        x_name = op.input_names[0]
+        x, y = self._var(x_name), self._var(op.output_name)
+        self.solver.add(y == x)
+        effective_dim = norm_dim % 2 if norm_dim < 0 else norm_dim
+        if effective_dim in (0, 1):
+            forbidden_pl = PL_S0 if effective_dim == 0 else PL_S1
+            self.solver.add(x != IntVal(forbidden_pl))
+
+    def _encode_softmax_op(self, op):
+        """Encode softmax: output == input, with forbidden Shard(reduction_dim) constraint."""
+        x_name = op.input_names[0]
+        x, y = self._var(x_name), self._var(op.output_name)
+        self.solver.add(y == x)
+        reduction_dim = op.dim
+        effective_dim = reduction_dim % 2 if reduction_dim < 0 else reduction_dim
+        if effective_dim in (0, 1):
+            forbidden_pl = PL_S0 if effective_dim == 0 else PL_S1
+            self.solver.add(x != IntVal(forbidden_pl))
 
     def _encode_to_replicate(self, op):
         y = self._var(op.output_name)
@@ -256,8 +278,13 @@ class Z3PlacementSolver:
                 y = self._var(op.output)
                 sd = op.scatter_dim
                 self.solver.add(y == IntVal(PL_S0 if sd == 0 else PL_S1))
+            elif isinstance(op, LayerNorm):
+                self._encode_norm_op(op, op.norm_dim)
+            elif isinstance(op, RMSNorm):
+                self._encode_norm_op(op, op.norm_dim)
+            elif isinstance(op, Softmax):
+                self._encode_softmax_op(op)
             elif isinstance(op, (SiLU, GELU, ReLU, Dropout,
-                                 LayerNorm, RMSNorm, Softmax,
                                  Reshape, Transpose, Cast, LossScale,
                                  FP8Quantize, FP8Dequantize,
                                  Reinterpret, Convert,
@@ -471,6 +498,167 @@ class Z3PlacementSolver:
                 ))
 
         return results
+
+    # ── Compute preconditions ─────────────────────────────────────────────
+
+    def _check_not_forbidden(
+        self, op_name: str, input_name: str,
+        forbidden_pl: int, forbidden_label: str,
+    ) -> VerifyResult:
+        """Check that an op's input can never reach a forbidden placement.
+
+        Pushes x == forbidden_pl; SAT means the forbidden state is reachable (FAIL).
+        UNSAT means it's provably unreachable (PASS).
+        """
+        x = self._vars.get(input_name)
+        if x is None:
+            return VerifyResult(
+                passed=True,
+                condition=f"{op_name}({input_name}) forbidden check",
+                details=f"Input '{input_name}' not in Z3 model (skipped)",
+            )
+
+        self.solver.push()
+        self.solver.add(x == IntVal(forbidden_pl))
+
+        check = self.solver.check()
+        if check == sat:
+            model = self.solver.model()
+            ce = {}
+            for n, var in self._vars.items():
+                val = model.eval(var, model_completion=True).as_long()
+                ce[n] = _PL_NAMES.get(val, str(val))
+            result = VerifyResult(
+                passed=False,
+                condition=f"{op_name}({input_name}) forbidden check",
+                details=(
+                    f"Input '{input_name}' can reach {forbidden_label}, "
+                    f"which is forbidden for {op_name}"
+                ),
+                counterexample=ce,
+            )
+        else:
+            result = VerifyResult(
+                passed=True,
+                condition=f"{op_name}({input_name}) forbidden check",
+                details=(
+                    f"Z3 proved: '{input_name}' can never be {forbidden_label} "
+                    f"(forbidden by {op_name})"
+                ),
+            )
+
+        self.solver.pop()
+        return result
+
+    def _check_not_both_partial(
+        self, op_name: str, a_name: str, b_name: str,
+    ) -> VerifyResult:
+        """Check that two inputs to a binary op cannot both be Partial."""
+        a = self._vars.get(a_name)
+        b = self._vars.get(b_name)
+        if a is None or b is None:
+            return VerifyResult(
+                passed=True,
+                condition=f"{op_name}({a_name}, {b_name}) partial×partial check",
+                details="Input(s) not in Z3 model (skipped)",
+            )
+
+        P = IntVal(PL_P)
+        self.solver.push()
+        self.solver.add(And(a == P, b == P))
+
+        check = self.solver.check()
+        if check == sat:
+            model = self.solver.model()
+            ce = {}
+            for n, var in self._vars.items():
+                val = model.eval(var, model_completion=True).as_long()
+                ce[n] = _PL_NAMES.get(val, str(val))
+            result = VerifyResult(
+                passed=False,
+                condition=f"{op_name}({a_name}, {b_name}) partial×partial check",
+                details=(
+                    f"Both '{a_name}' and '{b_name}' can be Partial simultaneously, "
+                    f"which is forbidden for {op_name}"
+                ),
+                counterexample=ce,
+            )
+        else:
+            result = VerifyResult(
+                passed=True,
+                condition=f"{op_name}({a_name}, {b_name}) partial×partial check",
+                details=(
+                    f"Z3 proved: '{a_name}' and '{b_name}' cannot both be Partial"
+                ),
+            )
+
+        self.solver.pop()
+        return result
+
+    def check_compute_preconditions(
+        self,
+        program: Program,
+    ) -> List[VerifyResult]:
+        """Verify compute op preconditions via Z3.
+
+        For each op with placement constraints:
+          - LayerNorm/RMSNorm: input must NOT be Shard(norm_dim)
+          - Softmax: input must NOT be Shard(reduction_dim)
+          - Add/Multiply: inputs must NOT both be Partial
+        """
+        results = []
+
+        for op in program.ops:
+            if isinstance(op, (LayerNorm, RMSNorm)):
+                norm_dim = op.norm_dim
+                effective_dim = norm_dim % 2 if norm_dim < 0 else norm_dim
+                if effective_dim in (0, 1):
+                    forbidden_pl = PL_S0 if effective_dim == 0 else PL_S1
+                    forbidden_label = f"Shard({effective_dim})"
+                    results.append(self._check_not_forbidden(
+                        type(op).__name__, op.x, forbidden_pl, forbidden_label,
+                    ))
+            elif isinstance(op, Softmax):
+                reduction_dim = op.dim
+                effective_dim = reduction_dim % 2 if reduction_dim < 0 else reduction_dim
+                if effective_dim in (0, 1):
+                    forbidden_pl = PL_S0 if effective_dim == 0 else PL_S1
+                    forbidden_label = f"Shard({effective_dim})"
+                    results.append(self._check_not_forbidden(
+                        "Softmax", op.x, forbidden_pl, forbidden_label,
+                    ))
+            elif isinstance(op, ElementWiseBinaryOp):
+                results.append(self._check_not_both_partial(
+                    type(op).__name__, op.a, op.b,
+                ))
+
+        return results
+
+    def check_program_satisfiability(self) -> VerifyResult:
+        """Check whether the full constraint set is satisfiable.
+
+        UNSAT means the program has conflicting placement requirements
+        (e.g., upstream forces Shard(1) but downstream LayerNorm forbids it).
+        """
+        self.solver.push()
+        check = self.solver.check()
+        self.solver.pop()
+
+        if check == unsat:
+            return VerifyResult(
+                passed=False,
+                condition="program satisfiability",
+                details=(
+                    "Placement constraints are contradictory (UNSAT) — "
+                    "program has conflicting placement requirements"
+                ),
+            )
+        else:
+            return VerifyResult(
+                passed=True,
+                condition="program satisfiability",
+                details="All placement constraints are satisfiable",
+            )
 
     # ── L1: Shape consistency ───────────────────────────────────────────────
 
@@ -1160,6 +1348,17 @@ class DistributedVerifier:
 
         z3s.encode_program(program)
 
+        # Check program satisfiability first
+        sat_result = z3s.check_program_satisfiability()
+        if not sat_result.passed:
+            vr = VerifyResult(
+                passed=False,
+                condition="placement consistency (Z3)",
+                details=sat_result.details,
+            )
+            self.results.append(vr)
+            return vr
+
         if output_names is None:
             all_inputs = {inp for op in program.ops for inp in op.input_names}
             output_names = [
@@ -1169,8 +1368,9 @@ class DistributedVerifier:
 
         eq_results = z3s.check_output_equivalence(output_names)
         pc_results = z3s.check_collective_preconditions(program)
+        cc_results = z3s.check_compute_preconditions(program)
 
-        all_checks = eq_results + pc_results
+        all_checks = eq_results + pc_results + cc_results
         all_passed = all(r.passed for r in all_checks)
 
         details_parts = []
@@ -1317,11 +1517,65 @@ class DistributedVerifier:
             program, final_tensors=final_tensors, output_names=output_names,
         )
 
-        # 5. Shape consistency
+        # 5. Shape consistency (Z3-based when shapes available)
         if initial_shapes:
-            self.verify_shape_consistency(program, initial_shapes, final_tensors)
+            self._verify_shape_z3(program, initial_shapes, final_tensors)
+        elif final_tensors:
+            self.verify_shape_consistency(program, {}, final_tensors)
 
         return self.results
+
+    def _verify_shape_z3(
+        self,
+        program: Program,
+        initial_shapes: Dict[str, Tuple[int, ...]],
+        final_tensors: Dict[str, TensorState],
+    ):
+        """Run Z3-based shape consistency and slice alignment checks."""
+        tp_size = None
+        for ts in final_tensors.values():
+            if ts.sharding and ts.sharding.mesh:
+                tp_size = ts.sharding.mesh.shape[0] if ts.sharding.mesh.shape else None
+                break
+
+        if tp_size is None or tp_size < 2:
+            self.verify_shape_consistency(program, initial_shapes, final_tensors)
+            return
+
+        z3s = Z3PlacementSolver()
+        for name, shape in initial_shapes.items():
+            z3s.add_input_shape(name, shape)
+            ts = final_tensors.get(name)
+            if ts and ts.sharding and ts.sharding.placements:
+                z3s.add_input(name, ts.sharding.placements[0])
+
+        z3s.encode_program(program)
+        z3s.encode_shape_constraints(program, tp_size)
+        z3s.encode_slice_constraints(program, tp_size)
+
+        shape_results = z3s.check_shape_consistency()
+        slice_results = z3s.check_slice_alignment(program)
+
+        shape_passed = all(r.passed for r in shape_results)
+        slice_passed = all(r.passed for r in slice_results)
+
+        if shape_results:
+            details = "; ".join(r.details for r in shape_results if not r.passed) \
+                if not shape_passed else "All shape constraints verified by Z3"
+            self.results.append(VerifyResult(
+                passed=shape_passed,
+                condition="shape consistency (Z3 L1)",
+                details=details,
+            ))
+
+        if slice_results:
+            details = "; ".join(r.details for r in slice_results if not r.passed) \
+                if not slice_passed else "All slice alignments verified by Z3"
+            self.results.append(VerifyResult(
+                passed=slice_passed,
+                condition="slice alignment (Z3 L2)",
+                details=details,
+            ))
 
     def summary(self) -> str:
         """Return a summary of all verification results."""
