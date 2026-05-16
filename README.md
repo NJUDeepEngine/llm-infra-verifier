@@ -1,125 +1,120 @@
 # LLM-Infra-Verifier
 
-> **Static verification framework for distributed LLM training infrastructure.**
-> Catch placement bugs and communication races — before you launch a single GPU job.
+> **Static verification framework for distributed LLM training.**
+> Catches placement bugs and communication races at compile time — no GPUs needed.
 
-[![Tests](https://img.shields.io/badge/tests-42%20passed-green)]()
-[![Benchmarks](https://img.shields.io/badge/benchmarks-35%20cases%20%7C%20100%25%20detection-blue)]()
+[![Tests](https://img.shields.io/badge/tests-531%20passed-green)]()
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)]()
 [![License](https://img.shields.io/badge/license-Apache%202.0-orange)]()
 
 ---
 
-## Why this exists
+## Why This Exists
 
 Distributed training bugs are **silent, intermittent, and catastrophic at scale**:
 
-| Bug | Symptom | Can you detect it by testing? |
-|-----|---------|-------------------------------|
-| Missing AllReduce | Wrong gradients, silently diverging weights | Only if you compare against single-GPU baseline |
-| GELU on sharded tensor | Numerically wrong but structurally valid output | Only if you check mathematical equivalence |
-| Async AllReduce without Wait | Race condition — works on some GPUs, fails on others | Flaky, CI-unfriendly |
+| Bug Type | Symptom | Traditional Detection |
+|----------|---------|----------------------|
+| Missing AllReduce after row-parallel MatMul | Silently diverging weights | Compare against single-GPU baseline |
+| LayerNorm on sharded hidden dim | Numerically wrong normalization | Check mathematical equivalence |
+| Async AllReduce without Wait | Race condition — works on some runs | Flaky, CI-unfriendly |
+| Mismatched Send/Recv in pipeline | Deadlock under specific schedules | Only surfaces at scale |
 
-**This verifier catches them all at compile time — in milliseconds, with zero GPUs.**
-
----
-
-## Two-Dimensional Verification
-
-The core insight: verify **what** and **when** — as independent dimensions.
-
-```
-                         Input Source
-                 TileLang TIR / PyTorch / Megatron
-                             │
-                             ▼
-                   ┌─────────────────┐
-                   │  Verification IR │  Unified intermediate representation
-                   │  (ir.py, 20 ops) │  Symbolic, not numeric
-                   └────────┬────────┘
-                            │
-              ┌─────────────┴─────────────┐
-              ▼                           ▼
-      ┌───────────────┐           ┌───────────────┐
-      │   SPATIAL     │           │   TEMPORAL    │
-      │ Where things  │           │ When things   │
-      │   go          │           │   happen      │
-      │               │           │               │
-      │ Z3 SMT solver │           │ HB graph + Z3 │
-      │ 6 checks      │           │ 4 checks      │
-      └───────────────┘           └───────────────┘
-```
-
-### Spatial: "Where does each tensor go?"
-
-| Check | What it verifies | Method |
-|-------|-----------------|--------|
-| Postcondition | Output tensors not PARTIAL at boundaries | Z3: `Bool("partial")==True → unsat` |
-| Communication legality | AllReduce only on Partial; Send↔Recv matched | Structural + Z3 |
-| Gradient duality | fwd collective has matching bwd dual | Type-based duality table |
-| Placement consistency | Output placement follows from inputs | Symbolic propagation rules |
-| Shape consistency | Shapes survive collectives unchanged | Structural validation |
-| PP deadlock freedom | No unmatched Send/Recv; no circular wait | DFS cycle detection |
-
-### Temporal: "When do things happen?"
-
-| Check | What it verifies | Method |
-|-------|-----------------|--------|
-| Data race | Different streams, same buffer, ≥1 write, unordered | HB interval overlap |
-| Missing Wait | Async output consumed before `Wait(handle)` | Handle-waited_by analysis |
-| Buffer aliasing | Two async ops writing same buffer concurrently | Write-after-write check |
-| Dependency violation | Recv before Send for same (src,dst,mb) | HB ordering constraint |
+**This verifier catches them all statically — in milliseconds, with zero GPUs.**
 
 ---
 
-## How It Works: Static Symbolic Simulation
-
-The key design decision: **we never run the program with concrete data**. Instead:
-
-### 1. Symbolic execution, not numeric execution
-
-```python
-# Traditional execution: compute actual values
-y = x @ w  # y = [[1.2, 3.4], ...]
-
-# Our symbolic execution: propagate metadata
-y = MatMul(x, w).apply(ctx)
-# y.placement = Partial()
-# y.shape = (8, 32)
-# y.expr = "(x @ w)"
-# y.local_shape = (8, 32)
-```
-
-The executor (`executor.py`) tracks **what each device holds** — placement, shape, symbolic expression — but never touches actual numbers.
-
-### 2. Z3 as the correctness oracle
-
-Placement correctness is encoded as SMT constraints:
+## Architecture
 
 ```
-Given: tensor y has sharding spec S
-Check:  is it possible that y.partial == True at the output?
-
-Z3 encoding:
-  Bool("partial") == y.partial      // actual state
-  (partial == True)                 // negated postcondition
-  → sat: bug found (y IS partial)
-  → unsat: safe (y cannot be partial)
+Input Source (PyTorch / Megatron / TileLang TIR)
+                    │
+                    ▼
+         ┌──────────────────┐
+         │  Verification IR  │   48 ops, symbolic metadata
+         │  verifier/ir/     │   not numeric values
+         └────────┬─────────┘
+                  │
+     ┌────────────┴────────────┐
+     ▼                         ▼
+┌──────────────┐        ┌──────────────┐
+│   SPATIAL    │        │   TEMPORAL   │
+│  "Where"     │        │  "When"      │
+│              │        │              │
+│ Z3 SMT       │        │ HB graph     │
+│ 6 checks     │        │ 4 checks     │
+└──────────────┘        └──────────────┘
 ```
 
-The elegance: we don't need to enumerate all possible sharding configurations. Z3 searches the space for us.
+### Spatial Verification (Z3-based)
 
-### 3. Happens-Before for temporal reasoning
+| Check | Property | Method |
+|-------|----------|--------|
+| Postcondition | Output not Partial at boundaries | Z3 UNSAT proof |
+| Communication legality | Collectives on valid inputs only | Structural + Z3 |
+| Gradient duality | fwd collective ↔ bwd dual | Type duality table |
+| Placement consistency | Output placement follows inputs | Symbolic propagation |
+| Shape consistency | Shapes valid through collectives | Divisibility constraints |
+| PP deadlock freedom | No circular Send/Recv waits | DFS cycle detection |
 
-Each op gets a time interval `[issue, complete)`. Constraints:
+### Temporal Verification (Happens-Before + Z3)
 
-```
-Same stream:     complete_i < issue_{i+1}
-Wait sync:       complete_async < issue_wait
-Data dependency: complete_writer < issue_reader
-```
+| Check | Property | Method |
+|-------|----------|--------|
+| Data race | Unordered concurrent R/W on same buffer | HB interval overlap |
+| Missing Wait | Async output read before sync | Handle-waited analysis |
+| Buffer aliasing | Two async ops write same buffer | WAW detection |
+| Dependency violation | Recv before matching Send | HB ordering |
 
-Z3 checks: "Does there exist a schedule where two unordered ops on different streams overlap on the same buffer?" If yes → race.
+---
+
+## IR Operations (48 ops)
+
+### Compute (13 ops)
+
+| Category | Ops | Sharding Semantics |
+|----------|-----|-------------------|
+| Linear algebra | MatMul | S(1)×S(0)→P, R×S(1)→S(1), S(0)×R→S(0) |
+| Element-wise binary | Add, Multiply | Merge placements; P×P forbidden |
+| Activations | SiLU, GELU, ReLU | Passthrough |
+| Regularization | Dropout | Passthrough |
+| Normalization | LayerNorm, RMSNorm | Error if Shard(norm_dim) |
+| Reduction | Softmax | Error if Shard(reduction_dim) |
+| Attention | FlashAttention | Follows Q placement |
+| Vocab-parallel | Embedding | weight Shard(vocab)→Partial |
+| Loss | CrossEntropyLoss | logits Shard(vocab)→Partial |
+
+### Communication (8 NCCL collectives + 4 P2P)
+
+| Op | Forward | Backward Dual |
+|----|---------|---------------|
+| AllReduce | Partial→Replicate | AllReduce (self) |
+| AllGather | Shard(d)→Replicate | ReduceScatter |
+| ReduceScatter | R/P→Shard(d) | AllGather |
+| Broadcast | any→Replicate | Reduce |
+| Reduce | Partial→Replicate(root) | Broadcast |
+| AllToAll | Shard(split)→Shard(concat) | AllToAll (dim-swap) |
+| Scatter | Replicate→Shard(d) | Gather |
+| Gather | Shard(d)→Replicate | Scatter |
+| Send/Recv | P2P data movement | Recv/Send (reversed) |
+| SendAsync/RecvAsync | Non-blocking P2P | — |
+
+### Async & Overlap (4 ops)
+AllReduceAsync, Wait, WaitAll, OverlapRegion
+
+### Precision (5 ops)
+Cast, LossScale, FP8Quantize, FP8Dequantize, AmaxUpdate
+
+### Parallelism-Specific (10 ops)
+
+| Domain | Ops |
+|--------|-----|
+| ZeRO | ZeROGatherParam, ZeROScatterGrad, ZeROPartitionOptState |
+| Context Parallelism | RingRotate, RingAttentionStep, RingAttention |
+| Mixture of Experts | TopKGate, MoEDispatch, MoECombine, ExpertCompute |
+
+### Shape & SPMD (4 ops)
+Reshape, Transpose, Reinterpret, Convert
 
 ---
 
@@ -127,24 +122,32 @@ Z3 checks: "Does there exist a schedule where two unordered ops on different str
 
 ```
 verifier/
-├── state.py           # TensorState, ShardingSpec, DeviceMesh
-├── ir.py              # 20 op types with fwd+VJP
-├── executor.py        # Multi-device symbolic executor
-├── autograd.py        # VJP autograd + gradient duality
-│
-├── solver.py          # Z3 spatial verifier, 6 checks
-├── temporal.py        # HB graph + Z3 race detection, 4 checks
-│
-├── rewrite.py         # Pattern matching, rewrite rules, cost model
-├── synthesis.py       # Verified parallelization synthesis
-├── llm_frontend.py    # PyTorch → IR via LLM + feedback loop
-├── tir_lifter.py      # TileLang TIR → distributed IR
-└── schedules.py       # 1F1B schedule + deadlock checker
+├── state/              # TensorState, ShardingSpec, DeviceMesh, placements
+├── ir/                 # 48 IR ops across 10 modules
+│   ├── compute.py      #   MatMul, activations, norm, attention, embedding, loss
+│   ├── collective.py   #   8 NCCL collectives
+│   ├── p2p.py          #   Send/Recv (sync + async)
+│   ├── async_ops.py    #   AllReduceAsync, Wait, OverlapRegion
+│   ├── precision.py    #   Cast, FP8, LossScale
+│   ├── shape.py        #   Reshape, Transpose
+│   ├── spmd.py         #   Reinterpret, Convert, SPMDGuard
+│   ├── zero.py         #   ZeRO-1/2/3 ops
+│   ├── cp.py           #   Ring attention ops
+│   └── moe.py          #   MoE dispatch/combine
+├── executor.py         # Multi-device symbolic executor
+├── solver.py           # Z3 spatial verifier (6 checks)
+├── temporal.py         # HB graph + race detection (4 checks)
+├── autograd.py         # VJP engine + gradient duality
+├── rewrite.py          # Pattern matching + cost model
+├── synthesis.py        # Beam-search tactic synthesis
+├── schedules.py        # PP 1F1B schedule + deadlock checker
+├── llm_frontend.py     # PyTorch → IR via LLM + feedback loop
+└── tir_lifter.py       # TileLang TIR → IR lifter
 
-examples/              # 6 runnable demos
-benchmarks/            # 35 cases across 3 suites
-tests/                 # 42 tests
-docs/                  # GitHub Pages documentation
+tests/                  # 531 tests across 11 files
+examples/               # 9 runnable demos
+benchmarks/             # 3 suites
+docs/                   # Architecture & API docs
 ```
 
 ---
@@ -153,127 +156,159 @@ docs/                  # GitHub Pages documentation
 
 ```bash
 pip install -r requirements.txt  # z3-solver, pytest
+python -m pytest tests/ -v       # run all 531 tests
 ```
 
-### Verify a Row Parallel Linear layer (spatial)
+### Example: Verify Tensor-Parallel Linear
 
 ```python
 from verifier import *
 
 mesh = DeviceMesh(shape=(2,), dim_names=("tp",))
-x = TensorState("x", (8, 16), (8, 8), ShardingSpec((Shard(dim=1),), mesh))
-w = TensorState("w", (16, 32), (8, 32), ShardingSpec((Shard(dim=0),), mesh))
+x_spec = ShardingSpec(placements=(Shard(dim=1),), mesh=mesh)
+w_spec = ShardingSpec(placements=(Shard(dim=0),), mesh=mesh)
 
-fwd = Program("tp").add(MatMul("x", "w", "y_partial")).add(AllReduce("y_partial", "y"))
-executor = MultiDeviceExecutor(mesh)
-executor.register_tensor(x); executor.register_tensor(w)
-state = executor.run_program(fwd)
+x = TensorState("x", (8, 16), compute_local_shape((8, 16), x_spec), x_spec, expr="x")
+w = TensorState("w", (16, 32), compute_local_shape((16, 32), w_spec), w_spec, expr="w")
+
+program = Program("tp_linear", ops=[
+    MatMul(a="x", b="w", output="y_partial"),
+    AllReduce(x="y_partial", output="y"),
+])
+
+executor = MultiDeviceExecutor(mesh=mesh)
+executor.register_tensor(x)
+executor.register_tensor(w)
+final = executor.run_program(program)
 
 verifier = DistributedVerifier()
-result = verifier.verify_postcondition(state["y"], expected_partial=False)
-print(f"Postcondition: {'PASSED' if result.passed else 'FAILED'}")
-# Remove the AllReduce line → verifier catches the bug
+results = verifier.verify_all(program, final)
+print(verifier.summary())
+# Verification Summary: 4 passed, 0 failed
 ```
 
-### Detect async communication race (temporal)
+### Example: Detect Async Race
 
 ```python
+from verifier import *
 from verifier.temporal import verify_temporal
 
-prog = Program("race")
-prog.add(MatMul("x", "w", "y_p"))
-prog.add(AllReduceAsync("y_p", "y", handle="h1", stream=COMM_STREAM))
-prog.add(MatMul("y", "w2", "z"))  # BUG: reads before Wait!
+prog = Program("race", ops=[
+    MatMul(a="x", b="w", output="y_p"),
+    AllReduceAsync(x="y_p", output="y", handle="h1"),
+    MatMul(a="y", b="w2", output="z"),  # BUG: reads y before Wait!
+])
 
 result = verify_temporal(prog)
 # Detected: MISSING_WAIT on tensor 'y'
 ```
 
----
+### Example: Vocab-Parallel Embedding
 
-## Demos & Benchmarks
+```python
+from verifier import *
 
-### Examples (6 demo scripts)
+mesh = DeviceMesh(shape=(2,), dim_names=("tp",))
+w_spec = ShardingSpec(placements=(Shard(dim=0),), mesh=mesh)
+ids_spec = ShardingSpec(placements=(Replicate(),), mesh=mesh)
 
-```bash
-# Spatial
-python examples/tp_linear.py       # Row Parallel: correct vs bug
-python examples/tp_mlp.py          # Megatron MLP: Column+Row Parallel
-python examples/pp_2stage.py       # 2-Stage 1F1B Pipeline
-python examples/cp_ring_attn.py    # Ring Attention with FlashAttention
+ids = TensorState("ids", (32,), (32,), ids_spec, expr="ids")
+W = TensorState("W", (50000, 128), compute_local_shape((50000, 128), w_spec), w_spec, expr="W")
 
-# Temporal
-python examples/overlap_demo.py    # 5 cases: race, missing wait, buffer alias
+program = Program("vocab_parallel", ops=[
+    Embedding(indices="ids", weight="W", output="emb_partial"),
+    AllReduce(x="emb_partial", output="emb"),
+])
 
-# Synthesis + LLM
-python examples/synthesis_demo.py  # Auto-synthesis + LLM extraction flow
+executor = MultiDeviceExecutor(mesh=mesh)
+executor.register_tensor(ids)
+executor.register_tensor(W)
+final = executor.run_program(program)
+
+assert not final["emb"].partial  # Output is Replicate after AllReduce
 ```
-
-### Benchmarks (35 cases, 3 suites, 100% detection)
-
-```bash
-# Suite 1: Synthetic bug patterns (16 cases from PyTorch/Megatron/TileLang GitHub issues)
-python benchmarks/benchmark_suite.py
-
-# Suite 2: Real-code validation (8 cases lifted from Megatron-LM + TileLang source)
-python benchmarks/real_code_validation.py
-
-# Suite 3: Real-bug benchmark (11 cases with original buggy code + translation notes)
-python benchmarks/real_bug_benchmark.py
-
-python benchmarks/benchmark_suite.py --list   # List all 16 cases by category
-python benchmarks/benchmark_suite.py --run B1 # Run specific category
-python benchmarks/benchmark_suite.py --json   # JSON output
-```
-
-### Tests
-
-```bash
-python -m pytest tests/test_verifier.py -v    # 42 tests
-```
-
-### Issue Coverage
-
-| Repository | Issues Used |
-|---|---|
-| `pytorch/pytorch` | #144359, #173041, #175690, #139681, #140227 |
-| `NVIDIA/Megatron-LM` | #4092, #3952, #1525, #4382 |
-| `tile-ai/tilelang` | #2035, #2042, #2054, #2158, #2172 |
-| `triton-lang/triton` | #9991, #9963, #10106, #10176 |
-| `deepseek-ai/TileKernels` | #2 |
 
 ---
 
-## Design Philosophy
+## Demos
 
-### 1. LLM proposes, Verifier checks — never the reverse
+```bash
+# Tensor Parallelism
+python examples/tp_linear.py          # Row-parallel: correct vs bug detection
+python examples/tp_mlp.py             # Megatron MLP: Column+Row parallel
 
-The LLM frontend can **suggest** IR translations, collective insertions, or parallelization tactics. But the formal verifier (Z3 + HB graph + IEEE 754 bounds) is the **final authority**. A program only passes if the verifier says so — no matter how confident the LLM is.
+# Pipeline Parallelism
+python examples/pp_2stage.py          # 2-stage 1F1B schedule verification
 
-### 2. Symbolic over numeric — verify all inputs at once
+# Context Parallelism
+python examples/cp_ring_attn.py       # Ring attention with FlashAttention
 
-We don't sample specific tensor values. We verify properties (placement correctness, race freedom, error bounds) that hold for **every possible input**. This is what makes static verification different from testing.
+# Temporal / Async
+python examples/overlap_demo.py       # Race, missing wait, buffer aliasing
 
-### 3. Dimensions are orthogonal — verify independently, compose results
+# SPMD Type System
+python examples/spmd_demo.py          # R/I/V/P types + gradient duality
 
-Spatial correctness doesn't imply temporal safety. Each dimension has its own verification technique, and a program is only fully verified when both pass.
+# Synthesis
+python examples/synthesis_demo.py     # Auto-synthesis from unannotated compute
 
-### 4. Pattern library over ad-hoc rules
-
-Known distributed patterns (RowParallel, ColumnParallel, 1F1B, Ring Attention) are first-class citizens. This enables:
-- **Detection**: recognize when a pattern is used incorrectly (e.g., GELU between Colwise and Rowwise without AllGather)
-- **Synthesis**: generate the correct collective insertion for a given compute pattern
-- **Optimization**: fuse or eliminate redundant collectives
+# End-to-End
+python examples/megatron_gpt2_verify.py   # Full Megatron GPT-2 verification
+python examples/consistency_demo.py       # Single-GPU equivalence proof
+```
 
 ---
 
-## Verification Coverage Matrix
+## SPMD Type System
 
-| | Spatial | Temporal |
-|---|---|---|
-| **Tensor Parallelism** | ✓ placement, postcond | ✓ async AR gradient |
-| **Pipeline Parallelism** | ✓ Send/Recv match | ✓ 1F1B schedule order |
-| **Context Parallelism** | ✓ ring order | ✓ async ring comm |
-| **Data Parallelism** | ✓ gradient duality | ✓ async AR |
-| **ZeRO-1/2/3** | ✓ shard consistency | ✓ ReduceScatter |
-| **FlashAttention** | ✓ CP placement | ✓ async overlap |
+Four local types with gradient duality:
+
+| Type | Meaning | Gradient Dual |
+|------|---------|---------------|
+| **R** (Replicate) | Same data on all ranks | P (Partial) |
+| **I** (Invariant) | Same data, no gradient comm needed | I (Invariant) |
+| **V** (Varying) | Different data per rank | V (Varying) |
+| **P** (Partial) | Pending sum across ranks | R (Replicate) |
+
+Key rules enforced by `SPMDGuard`:
+- `Partial × Partial` is **forbidden** (doesn't distribute over pending sum)
+- `AllReduce(Replicate)` is an **error** (no pending sum exists)
+- `AllReduce(Invariant)` is an **error** (gradient already identical)
+
+---
+
+## Verification Coverage
+
+| Parallelism Strategy | Spatial Checks | Temporal Checks |
+|---------------------|----------------|-----------------|
+| Tensor Parallelism | Placement, postcondition, shape | Async AllReduce races |
+| Pipeline Parallelism | Send/Recv matching, deadlock | 1F1B schedule ordering |
+| Context Parallelism | Ring placement propagation | Async ring communication |
+| Data Parallelism | Gradient duality | Async gradient AllReduce |
+| ZeRO-1/2/3 | Shard/gather consistency | ReduceScatter ordering |
+| MoE (Expert Parallel) | AllToAll dispatch/combine | Token routing races |
+| Mixed Precision (FP8) | Scale freshness, format usage | Delayed scaling ordering |
+
+---
+
+## Design Principles
+
+1. **Symbolic over numeric** — verify properties for ALL possible inputs, not samples
+2. **LLM proposes, Verifier decides** — Z3 is the final authority, not model confidence
+3. **Spatial × Temporal** — independent dimensions, composed results
+4. **Every op has VJP** — forward and backward are equally verifiable
+5. **Zero dependencies beyond Z3** — no PyTorch, no CUDA, no cluster needed
+
+---
+
+## References
+
+Bugs sourced from real distributed training issues:
+
+| Repository | Issues |
+|------------|--------|
+| pytorch/pytorch | #144359, #173041, #175690, #139681, #140227 |
+| NVIDIA/Megatron-LM | #4092, #3952, #1525, #4382 |
+| tile-ai/tilelang | #2035, #2042, #2054, #2158, #2172 |
+| triton-lang/triton | #9991, #9963, #10106, #10176 |
+| deepseek-ai/TileKernels | #2 |
