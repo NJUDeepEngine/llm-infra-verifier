@@ -613,3 +613,196 @@ class TestEndToEnd:
         # Compute preconditions pass
         cc_results = solver.check_compute_preconditions(program)
         assert all(r.passed for r in cc_results)
+
+
+# ── Multi-dimensional mesh tests ──────────────────────────────────────────────
+
+
+class TestMultiDimMesh:
+    """Z3 solver correctly handles 2D+ mesh placements."""
+
+    def test_2d_mesh_matmul_tp_dp(self):
+        """2D mesh (tp=2, dp=4): MatMul with TP on dim1, DP on dim0.
+
+        x: (Shard(1), Shard(0)) — split cols on TP, split rows on DP
+        w: (Shard(0), Replicate) — split rows on TP, replicated on DP
+        y: (Partial, Shard(0)) — partial on TP dim, still sharded on DP
+        """
+        program = Program("tp_dp_matmul", ops=[
+            MatMul(a="x", b="w", output="y"),
+        ])
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        solver.add_input("x", (Shard(dim=1), Shard(dim=0)))
+        solver.add_input("w", (Shard(dim=0), Replicate()))
+        solver.encode_program(program)
+
+        sat_result = solver.check_program_satisfiability()
+        assert sat_result.passed
+
+        # y should be (Partial, Shard(0)) — TP dim produces Partial, DP dim passes S0
+        # Check that y is NOT Replicate on all dims (it's Partial on dim 0)
+        eq_results = solver.check_output_equivalence(["y"])
+        assert not all(r.passed for r in eq_results)
+
+    def test_2d_mesh_allreduce_resolves_tp_dim(self):
+        """AllReduce after MatMul resolves Partial on TP dim.
+
+        After AllReduce: y goes from (P, S0) to (R, R).
+        But since AllReduce makes output R on ALL mesh dims, the DP shard is lost.
+        In practice, the DP shard is on the batch dim so AllReduce on TP group only
+        affects TP mesh dim. However, our Z3 model encodes AllReduce as → R per dim.
+        """
+        program = Program("tp_dp_ar", ops=[
+            MatMul(a="x", b="w", output="y_p"),
+            AllReduce(x="y_p", output="y"),
+        ])
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        solver.add_input("x", (Shard(dim=1), Shard(dim=0)))
+        solver.add_input("w", (Shard(dim=0), Replicate()))
+        solver.encode_program(program)
+
+        sat_result = solver.check_program_satisfiability()
+        assert sat_result.passed
+
+        # AllReduce output is Replicate on all mesh dims
+        eq_results = solver.check_output_equivalence(["y"])
+        assert all(r.passed for r in eq_results)
+
+    def test_2d_mesh_forbidden_layernorm(self):
+        """2D mesh: LayerNorm(norm_dim=1) forbids S1 on BOTH mesh dims."""
+        program = Program("2d_ln", ops=[
+            LayerNorm(x="x", output="y", norm_dim=1),
+        ])
+        # Input is S1 on mesh dim 1 (DP dim) — should be forbidden
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        solver.add_input("x", (Replicate(), Shard(dim=1)))
+        solver.encode_program(program)
+
+        sat_result = solver.check_program_satisfiability()
+        assert not sat_result.passed
+
+    def test_2d_mesh_layernorm_shard_batch_safe(self):
+        """2D mesh: LayerNorm(norm_dim=1) with Shard(0) on any mesh dim is safe."""
+        program = Program("2d_ln_ok", ops=[
+            LayerNorm(x="x", output="y", norm_dim=1),
+        ])
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        solver.add_input("x", (Shard(dim=0), Shard(dim=0)))
+        solver.encode_program(program)
+
+        sat_result = solver.check_program_satisfiability()
+        assert sat_result.passed
+
+    def test_2d_mesh_partial_partial_forbidden_per_dim(self):
+        """2D mesh: Add(Partial, Partial) forbidden on each mesh dim independently."""
+        program = Program("2d_add_pp", ops=[
+            Add(a="x", b="y", output="z"),
+        ])
+        # Partial on mesh dim 0 for both — forbidden
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        solver.add_input("x", (Partial(), Replicate()))
+        solver.add_input("y", (Partial(), Replicate()))
+        solver.encode_program(program)
+
+        sat_result = solver.check_program_satisfiability()
+        assert not sat_result.passed
+
+    def test_2d_mesh_partial_replicate_safe(self):
+        """2D mesh: Add(Partial on m0, Replicate on m0) — safe per-dim merge."""
+        program = Program("2d_add_pr", ops=[
+            Add(a="x", b="y", output="z"),
+        ])
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        solver.add_input("x", (Partial(), Shard(dim=0)))
+        solver.add_input("y", (Replicate(), Shard(dim=0)))
+        solver.encode_program(program)
+
+        sat_result = solver.check_program_satisfiability()
+        assert sat_result.passed
+
+    def test_2d_mesh_embedding_partial_on_tp(self):
+        """2D mesh: Embedding with weight S(0) on TP dim produces Partial on TP."""
+        program = Program("2d_emb", ops=[
+            Embedding(indices="ids", weight="W", output="emb"),
+        ])
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        solver.add_input("ids", (Replicate(), Replicate()))
+        solver.add_input("W", (Shard(dim=0), Replicate()))
+        solver.encode_program(program)
+
+        sat_result = solver.check_program_satisfiability()
+        assert sat_result.passed
+
+        # emb is NOT replicate on mesh dim 0 (it's Partial there)
+        eq_results = solver.check_output_equivalence(["emb"])
+        assert not all(r.passed for r in eq_results)
+
+    def test_2d_mesh_reducescatter(self):
+        """2D mesh: ReduceScatter produces Shard on the scatter dim per mesh dim."""
+        program = Program("2d_rs", ops=[
+            ReduceScatter(x="x", output="y", scatter_dim=0),
+        ])
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        solver.add_input("x", (Partial(), Partial()))
+        solver.encode_program(program)
+
+        sat_result = solver.check_program_satisfiability()
+        assert sat_result.passed
+
+    def test_2d_mesh_flash_attention_follows_q(self):
+        """2D mesh: FlashAttention output placement follows Q on all mesh dims."""
+        program = Program("2d_fa", ops=[
+            FlashAttention(q="q", k="k", v="v", output="attn"),
+        ])
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        solver.add_input("q", (Shard(dim=0), Replicate()))
+        solver.add_input("k", (Replicate(), Replicate()))
+        solver.add_input("v", (Replicate(), Replicate()))
+        solver.encode_program(program)
+
+        sat_result = solver.check_program_satisfiability()
+        assert sat_result.passed
+
+        # attn should follow q: (S0, R) — not Replicate on all dims
+        eq_results = solver.check_output_equivalence(["attn"])
+        assert not all(r.passed for r in eq_results)
+
+    def test_verify_placement_consistency_detects_mesh_ndim(self):
+        """DistributedVerifier auto-detects 2D mesh and uses multi-dim solver."""
+        mesh = DeviceMesh(shape=(2, 4), dim_names=("tp", "dp"))
+        spec_s1_r = ShardingSpec(placements=(Shard(dim=1), Replicate()), mesh=mesh)
+        spec_s0_r = ShardingSpec(placements=(Shard(dim=0), Replicate()), mesh=mesh)
+
+        x = TensorState("x", (8, 16), (8, 8), spec_s1_r, expr="x")
+        w = TensorState("w", (16, 32), (8, 32), spec_s0_r, expr="w")
+
+        program = Program("2d_verify", ops=[
+            MatMul(a="x", b="w", output="y_p"),
+            AllReduce(x="y_p", output="y"),
+        ])
+
+        verifier = DistributedVerifier()
+        result = verifier.verify_placement_consistency(
+            program,
+            final_tensors={"x": x, "w": w},
+            output_names=["y"],
+        )
+        assert result.passed
+
+    def test_2d_mesh_shape_constraints(self):
+        """2D mesh: shape divisibility checked per mesh dim."""
+        program = Program("2d_shapes", ops=[
+            MatMul(a="x", b="w", output="y_p"),
+            AllReduce(x="y_p", output="y"),
+        ])
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        solver.add_input("x", (Shard(dim=1), Shard(dim=0)))
+        solver.add_input("w", (Shard(dim=0), Replicate()))
+        solver.add_input_shape("x", (8, 16))
+        solver.add_input_shape("w", (16, 32))
+        solver.encode_program(program)
+        solver.encode_shape_constraints(program, mesh_sizes=[2, 4])
+
+        shape_results = solver.check_shape_consistency()
+        # All divisibility checks should pass: 16/2=8 (TP on x cols), 8/4=2 (DP on x rows)
+        assert all(r.passed for r in shape_results)

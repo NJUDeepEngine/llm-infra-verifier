@@ -119,23 +119,29 @@ class Z3PlacementSolver:
       L2: Slice alignment (per-device offset correspondence)
 
     Each tensor gets:
-      - Z3 Int for placement: pl_{name} ∈ {0,1,2,3}
+      - Z3 Ints for placement: pl_{name}_m{d} ∈ {0,1,2,3}, one per mesh dim
       - Z3 Ints for shape: gs_{name}_0, gs_{name}_1 (global dims)
       - Z3 Ints for local shape: ls_{name}_0, ls_{name}_1
     """
 
-    def __init__(self):
+    def __init__(self, mesh_ndim: int = 1):
         self.solver = Solver()
-        self._vars: Dict[str, Int] = {}
+        self._mesh_ndim = mesh_ndim
+        self._vars: Dict[str, List] = {}
         self._shape_vars: Dict[str, List] = {}
         self._local_vars: Dict[str, List] = {}
         self._tp_size: Optional[int] = None
+        self._mesh_sizes: Optional[List[int]] = None
 
-    def _var(self, name: str):
+    def _var(self, name: str) -> List:
+        """Get or create Z3 placement variables for a tensor (one per mesh dim)."""
         if name not in self._vars:
-            v = Int(f"pl_{name}")
-            self.solver.add(And(v >= 0, v <= 3))
-            self._vars[name] = v
+            vs = []
+            for m in range(self._mesh_ndim):
+                v = Int(f"pl_{name}_m{m}")
+                self.solver.add(And(v >= 0, v <= 3))
+                vs.append(v)
+            self._vars[name] = vs
         return self._vars[name]
 
     def _shape_var(self, name: str, ndim: int = 2):
@@ -159,15 +165,30 @@ class Z3PlacementSolver:
         return sum(len(v) for v in self._shape_vars.values()) + \
                sum(len(v) for v in self._local_vars.values())
 
-    def add_input(self, name: str, placement: Placement):
-        """Assert a known concrete placement for an input tensor."""
-        v = self._var(name)
-        if isinstance(placement, Replicate):
-            self.solver.add(v == PL_R)
-        elif isinstance(placement, Shard):
-            self.solver.add(v == (PL_S0 if placement.dim == 0 else PL_S1))
-        elif isinstance(placement, Partial):
-            self.solver.add(v == PL_P)
+    def _placement_to_int(self, p: Placement) -> int:
+        if isinstance(p, Replicate):
+            return PL_R
+        elif isinstance(p, Shard):
+            return PL_S0 if p.dim == 0 else PL_S1
+        elif isinstance(p, Partial):
+            return PL_P
+        return PL_R
+
+    def add_input(self, name: str, placement):
+        """Assert known concrete placement(s) for an input tensor.
+
+        Args:
+            placement: Single Placement (applied to mesh dim 0) or tuple of
+                       Placements (one per mesh dim).
+        """
+        vs = self._var(name)
+        if isinstance(placement, (list, tuple)):
+            for m, p in enumerate(placement):
+                if m < self._mesh_ndim:
+                    vs[m]
+                    self.solver.add(vs[m] == self._placement_to_int(p))
+        else:
+            self.solver.add(vs[0] == self._placement_to_int(placement))
 
     def add_input_shape(self, name: str, shape: Tuple[int, ...]):
         """Assert concrete shape for an input tensor."""
@@ -179,79 +200,94 @@ class Z3PlacementSolver:
 
     def _encode_matmul(self, op):
         R, S0, S1, P = IntVal(PL_R), IntVal(PL_S0), IntVal(PL_S1), IntVal(PL_P)
-        a, b, y = self._var(op.a), self._var(op.b), self._var(op.output)
-        self.solver.add(y == If(Or(a == P, b == P), P,
-                            If(And(a == S1, b == S0), P,
-                            If(And(a == R,  b == S1), S1,
-                            If(And(a == S0, b == R),  S0,
-                            If(And(a == R,  b == R),  R,
-                            If(And(a == S1, b == R),  S1,
-                            If(And(a == R,  b == S0), S0,
-                            P))))))))
+        a_vs, b_vs, y_vs = self._var(op.a), self._var(op.b), self._var(op.output)
+        for m in range(self._mesh_ndim):
+            a, b, y = a_vs[m], b_vs[m], y_vs[m]
+            self.solver.add(y == If(Or(a == P, b == P), P,
+                                If(And(a == S1, b == S0), P,
+                                If(And(a == R,  b == S1), S1,
+                                If(And(a == S0, b == R),  S0,
+                                If(And(a == R,  b == R),  R,
+                                If(And(a == S1, b == R),  S1,
+                                If(And(a == R,  b == S0), S0,
+                                P))))))))
 
     def _encode_elementwise(self, op):
         R, P = IntVal(PL_R), IntVal(PL_P)
-        a, b, y = self._var(op.a), self._var(op.b), self._var(op.output)
-        self.solver.add(y == If(a == R, b, If(b == R, a, a)))
-        self.solver.add(Not(And(a == P, b == P)))
+        a_vs, b_vs, y_vs = self._var(op.a), self._var(op.b), self._var(op.output)
+        for m in range(self._mesh_ndim):
+            a, b, y = a_vs[m], b_vs[m], y_vs[m]
+            self.solver.add(y == If(a == R, b, If(b == R, a, a)))
+            self.solver.add(Not(And(a == P, b == P)))
 
     def _encode_passthrough(self, op):
         x_name = op.input_names[0]
-        x, y = self._var(x_name), self._var(op.output_name)
-        self.solver.add(y == x)
+        x_vs, y_vs = self._var(x_name), self._var(op.output_name)
+        for m in range(self._mesh_ndim):
+            self.solver.add(y_vs[m] == x_vs[m])
 
     def _encode_norm_op(self, op, norm_dim: int):
         """Encode norm op: output == input, with forbidden Shard(norm_dim) constraint."""
         x_name = op.input_names[0]
-        x, y = self._var(x_name), self._var(op.output_name)
-        self.solver.add(y == x)
+        x_vs, y_vs = self._var(x_name), self._var(op.output_name)
         effective_dim = norm_dim % 2 if norm_dim < 0 else norm_dim
-        if effective_dim in (0, 1):
-            forbidden_pl = PL_S0 if effective_dim == 0 else PL_S1
-            self.solver.add(x != IntVal(forbidden_pl))
+        forbidden_pl = PL_S0 if effective_dim == 0 else PL_S1
+        for m in range(self._mesh_ndim):
+            self.solver.add(y_vs[m] == x_vs[m])
+            if effective_dim in (0, 1):
+                self.solver.add(x_vs[m] != IntVal(forbidden_pl))
 
     def _encode_softmax_op(self, op):
         """Encode softmax: output == input, with forbidden Shard(reduction_dim) constraint."""
         x_name = op.input_names[0]
-        x, y = self._var(x_name), self._var(op.output_name)
-        self.solver.add(y == x)
+        x_vs, y_vs = self._var(x_name), self._var(op.output_name)
         reduction_dim = op.dim
         effective_dim = reduction_dim % 2 if reduction_dim < 0 else reduction_dim
-        if effective_dim in (0, 1):
-            forbidden_pl = PL_S0 if effective_dim == 0 else PL_S1
-            self.solver.add(x != IntVal(forbidden_pl))
+        forbidden_pl = PL_S0 if effective_dim == 0 else PL_S1
+        for m in range(self._mesh_ndim):
+            self.solver.add(y_vs[m] == x_vs[m])
+            if effective_dim in (0, 1):
+                self.solver.add(x_vs[m] != IntVal(forbidden_pl))
 
     def _encode_to_replicate(self, op):
-        y = self._var(op.output_name)
-        self.solver.add(y == IntVal(PL_R))
+        y_vs = self._var(op.output_name)
+        for m in range(self._mesh_ndim):
+            self.solver.add(y_vs[m] == IntVal(PL_R))
 
     def _encode_reducescatter(self, op):
-        y = self._var(op.output)
+        y_vs = self._var(op.output)
         sd = op.scatter_dim
-        self.solver.add(y == IntVal(PL_S0 if sd == 0 else PL_S1))
+        for m in range(self._mesh_ndim):
+            self.solver.add(y_vs[m] == IntVal(PL_S0 if sd == 0 else PL_S1))
 
     def _encode_alltoall(self, op):
-        y = self._var(op.output)
+        y_vs = self._var(op.output)
         cd = op.concat_dim
-        self.solver.add(y == IntVal(PL_S0 if cd == 0 else PL_S1))
+        for m in range(self._mesh_ndim):
+            self.solver.add(y_vs[m] == IntVal(PL_S0 if cd == 0 else PL_S1))
 
     def _encode_flash_attention(self, op):
-        q, y = self._var(op.q), self._var(op.output)
-        self.solver.add(y == q)
+        q_vs, y_vs = self._var(op.q), self._var(op.output)
+        for m in range(self._mesh_ndim):
+            self.solver.add(y_vs[m] == q_vs[m])
 
     def _encode_embedding(self, op):
         """Embedding: weight Shard(0) -> Partial, otherwise passthrough."""
-        w, y = self._var(op.weight), self._var(op.output)
-        self.solver.add(y == If(w == IntVal(PL_S0), IntVal(PL_P), w))
+        w_vs, y_vs = self._var(op.weight), self._var(op.output)
+        for m in range(self._mesh_ndim):
+            self.solver.add(y_vs[m] == If(
+                w_vs[m] == IntVal(PL_S0), IntVal(PL_P), w_vs[m]))
 
     def _encode_cross_entropy(self, op):
         """CrossEntropyLoss: logits Shard(vocab) -> Partial, else Replicate."""
-        x, y = self._var(op.logits), self._var(op.output)
-        self.solver.add(y == If(
-            Or(x == IntVal(PL_S0), x == IntVal(PL_S1), x == IntVal(PL_P)),
-            IntVal(PL_P),
-            IntVal(PL_R),
-        ))
+        x_vs, y_vs = self._var(op.logits), self._var(op.output)
+        for m in range(self._mesh_ndim):
+            self.solver.add(y_vs[m] == If(
+                Or(x_vs[m] == IntVal(PL_S0), x_vs[m] == IntVal(PL_S1),
+                   x_vs[m] == IntVal(PL_P)),
+                IntVal(PL_P),
+                IntVal(PL_R),
+            ))
 
     def encode_program(self, program: Program):
         """Walk all ops and add Z3 constraints for placement propagation."""
@@ -269,15 +305,17 @@ class Z3PlacementSolver:
             elif isinstance(op, (AllReduce, AllGather, Broadcast, Reduce, Gather)):
                 self._encode_to_replicate(op)
             elif isinstance(op, Scatter):
-                y = self._var(op.output)
+                y_vs = self._var(op.output)
                 sd = op.scatter_dim
-                self.solver.add(y == IntVal(PL_S0 if sd == 0 else PL_S1))
+                for m in range(self._mesh_ndim):
+                    self.solver.add(y_vs[m] == IntVal(PL_S0 if sd == 0 else PL_S1))
             elif isinstance(op, (ZeROGatherParam,)):
                 self._encode_to_replicate(op)
             elif isinstance(op, ZeROScatterGrad):
-                y = self._var(op.output)
+                y_vs = self._var(op.output)
                 sd = op.scatter_dim
-                self.solver.add(y == IntVal(PL_S0 if sd == 0 else PL_S1))
+                for m in range(self._mesh_ndim):
+                    self.solver.add(y_vs[m] == IntVal(PL_S0 if sd == 0 else PL_S1))
             elif isinstance(op, LayerNorm):
                 self._encode_norm_op(op, op.norm_dim)
             elif isinstance(op, RMSNorm):
@@ -322,33 +360,46 @@ class Z3PlacementSolver:
             if hasattr(op, 'input_names') and op.input_names:
                 self._encode_passthrough(op)
 
+    def _extract_counterexample(self) -> Dict[str, str]:
+        """Extract a human-readable counterexample from the current SAT model."""
+        model = self.solver.model()
+        ce = {}
+        for n, vs in self._vars.items():
+            if self._mesh_ndim == 1:
+                val = model.eval(vs[0], model_completion=True).as_long()
+                ce[n] = _PL_NAMES.get(val, str(val))
+            else:
+                parts = []
+                for m, v in enumerate(vs):
+                    val = model.eval(v, model_completion=True).as_long()
+                    parts.append(_PL_NAMES.get(val, str(val)))
+                ce[n] = f"({', '.join(parts)})"
+        return ce
+
     def check_output_equivalence(
         self,
         output_names: List[str],
     ) -> List[VerifyResult]:
-        """Check if all outputs are guaranteed Replicate (= single-GPU equivalent).
+        """Check if all outputs are guaranteed Replicate on all mesh dims.
 
-        For each output, Z3 checks whether the output can be non-Replicate.
+        For each output, Z3 checks whether any mesh dim can be non-Replicate.
         UNSAT → proved equivalent. SAT → counterexample showing the violation.
         """
         results = []
         R = IntVal(PL_R)
 
         for name in output_names:
-            v = self._vars.get(name)
-            if v is None:
+            vs = self._vars.get(name)
+            if vs is None:
                 continue
 
             self.solver.push()
-            self.solver.add(v != R)
+            # Output must be Replicate on ALL mesh dims; check if any can be non-R
+            self.solver.add(Or(*[v != R for v in vs]))
 
             check = self.solver.check()
             if check == sat:
-                model = self.solver.model()
-                ce = {}
-                for n, var in self._vars.items():
-                    val = model.eval(var, model_completion=True).as_long()
-                    ce[n] = _PL_NAMES.get(val, str(val))
+                ce = self._extract_counterexample()
                 results.append(VerifyResult(
                     passed=False,
                     condition=f"equivalence({name})",
@@ -375,16 +426,18 @@ class Z3PlacementSolver:
     def _check_precondition(
         self, op_name: str, input_name: str,
         required_pl: int, required_label: str,
+        mesh_dim: int = 0,
     ) -> VerifyResult:
-        """Check that an op's input always has the required placement."""
-        x = self._vars.get(input_name)
-        if x is None:
+        """Check that an op's input always has the required placement on a mesh dim."""
+        vs = self._vars.get(input_name)
+        if vs is None:
             return VerifyResult(
                 passed=True,
                 condition=f"{op_name}({input_name}) precondition",
                 details=f"Input '{input_name}' not in Z3 model (skipped)",
             )
 
+        x = vs[min(mesh_dim, len(vs) - 1)]
         self.solver.push()
         self.solver.add(x != IntVal(required_pl))
 
@@ -416,16 +469,18 @@ class Z3PlacementSolver:
     def _check_precondition_or(
         self, op_name: str, input_name: str,
         allowed_pls: List[int], label: str,
+        mesh_dim: int = 0,
     ) -> VerifyResult:
         """Check that an op's input always has one of the allowed placements."""
-        x = self._vars.get(input_name)
-        if x is None:
+        vs = self._vars.get(input_name)
+        if vs is None:
             return VerifyResult(
                 passed=True,
                 condition=f"{op_name}({input_name}) precondition",
                 details=f"Input '{input_name}' not in Z3 model (skipped)",
             )
 
+        x = vs[min(mesh_dim, len(vs) - 1)]
         self.solver.push()
         self.solver.add(And(*[x != IntVal(pl) for pl in allowed_pls]))
 
@@ -505,13 +560,12 @@ class Z3PlacementSolver:
         self, op_name: str, input_name: str,
         forbidden_pl: int, forbidden_label: str,
     ) -> VerifyResult:
-        """Check that an op's input can never reach a forbidden placement.
+        """Check that an op's input can never reach a forbidden placement on any mesh dim.
 
-        Pushes x == forbidden_pl; SAT means the forbidden state is reachable (FAIL).
-        UNSAT means it's provably unreachable (PASS).
+        Pushes x_m == forbidden_pl for any m; SAT means the forbidden state is reachable.
         """
-        x = self._vars.get(input_name)
-        if x is None:
+        vs = self._vars.get(input_name)
+        if vs is None:
             return VerifyResult(
                 passed=True,
                 condition=f"{op_name}({input_name}) forbidden check",
@@ -519,15 +573,11 @@ class Z3PlacementSolver:
             )
 
         self.solver.push()
-        self.solver.add(x == IntVal(forbidden_pl))
+        self.solver.add(Or(*[v == IntVal(forbidden_pl) for v in vs]))
 
         check = self.solver.check()
         if check == sat:
-            model = self.solver.model()
-            ce = {}
-            for n, var in self._vars.items():
-                val = model.eval(var, model_completion=True).as_long()
-                ce[n] = _PL_NAMES.get(val, str(val))
+            ce = self._extract_counterexample()
             result = VerifyResult(
                 passed=False,
                 condition=f"{op_name}({input_name}) forbidden check",
@@ -553,10 +603,10 @@ class Z3PlacementSolver:
     def _check_not_both_partial(
         self, op_name: str, a_name: str, b_name: str,
     ) -> VerifyResult:
-        """Check that two inputs to a binary op cannot both be Partial."""
-        a = self._vars.get(a_name)
-        b = self._vars.get(b_name)
-        if a is None or b is None:
+        """Check that two inputs to a binary op cannot both be Partial on any mesh dim."""
+        a_vs = self._vars.get(a_name)
+        b_vs = self._vars.get(b_name)
+        if a_vs is None or b_vs is None:
             return VerifyResult(
                 passed=True,
                 condition=f"{op_name}({a_name}, {b_name}) partial×partial check",
@@ -565,15 +615,12 @@ class Z3PlacementSolver:
 
         P = IntVal(PL_P)
         self.solver.push()
-        self.solver.add(And(a == P, b == P))
+        self.solver.add(Or(*[And(a_vs[m] == P, b_vs[m] == P)
+                             for m in range(self._mesh_ndim)]))
 
         check = self.solver.check()
         if check == sat:
-            model = self.solver.model()
-            ce = {}
-            for n, var in self._vars.items():
-                val = model.eval(var, model_completion=True).as_long()
-                ce[n] = _PL_NAMES.get(val, str(val))
+            ce = self._extract_counterexample()
             result = VerifyResult(
                 passed=False,
                 condition=f"{op_name}({a_name}, {b_name}) partial×partial check",
@@ -662,16 +709,56 @@ class Z3PlacementSolver:
 
     # ── L1: Shape consistency ───────────────────────────────────────────────
 
-    def _add_local_shape_constraints(self, gs, ls, pl, tp):
-        """Add local_shape = global / tp_if_sharded for each dim."""
-        S0, S1 = IntVal(PL_S0), IntVal(PL_S1)
-        for d in range(len(gs)):
-            self.solver.add(ls[d] == If(
-                And(pl == S0, IntVal(d) == 0), gs[d] / tp,
-                If(And(pl == S1, IntVal(d) == 1), gs[d] / tp,
-                   gs[d])))
+    def _add_local_shape_constraints(self, gs, ls, pl_vars, mesh_sizes):
+        """Add local_shape = global / product(sharding mesh sizes) for each dim.
 
-    def _encode_shape_passthrough(self, op, tp):
+        Args:
+            gs: global shape Z3 vars (one per tensor dim)
+            ls: local shape Z3 vars (one per tensor dim)
+            pl_vars: list of Z3 placement vars (one per mesh dim)
+            mesh_sizes: list of ints (size per mesh dim), or single int for 1D
+        """
+        S0, S1 = IntVal(PL_S0), IntVal(PL_S1)
+        if isinstance(mesh_sizes, int):
+            mesh_sizes = [mesh_sizes]
+
+        for d in range(len(gs)):
+            shard_pl = PL_S0 if d == 0 else PL_S1
+            # Build the divisor: product of mesh_sizes[m] for all m where pl_vars[m] == Shard(d)
+            # For 1D: simple If. For multi-dim: nested conditionals.
+            if len(pl_vars) == 1:
+                tp = IntVal(mesh_sizes[0])
+                self.solver.add(ls[d] == If(
+                    pl_vars[0] == IntVal(shard_pl), gs[d] / tp, gs[d]))
+            else:
+                # Multi-dim: enumerate combinations
+                # local = global / product(mesh_sizes[m] for m where pl[m] shards this dim)
+                expr = gs[d]
+                # Build from innermost: check each mesh dim independently
+                # For 2D: divisor = s0_if_m0_shards * s1_if_m1_shards
+                # Express as nested If:
+                # Start with full division, then peel off
+                divisors = []
+                for m in range(len(pl_vars)):
+                    if m < len(mesh_sizes):
+                        divisors.append((pl_vars[m], IntVal(mesh_sizes[m])))
+
+                if len(divisors) == 2:
+                    m0_pl, s0 = divisors[0]
+                    m1_pl, s1 = divisors[1]
+                    sp = IntVal(shard_pl)
+                    self.solver.add(ls[d] == If(
+                        And(m0_pl == sp, m1_pl == sp), gs[d] / (s0 * s1),
+                        If(m0_pl == sp, gs[d] / s0,
+                        If(m1_pl == sp, gs[d] / s1,
+                        gs[d]))))
+                else:
+                    # Fallback for 3+ dims: only handle first mesh dim
+                    tp = IntVal(mesh_sizes[0])
+                    self.solver.add(ls[d] == If(
+                        pl_vars[0] == IntVal(shard_pl), gs[d] / tp, gs[d]))
+
+    def _encode_shape_passthrough(self, op, mesh_sizes):
         """Shape constraint for ops that preserve shape (SiLU, Cast, etc.)."""
         x_name = op.input_names[0]
         if x_name not in self._shape_vars:
@@ -681,10 +768,13 @@ class Z3PlacementSolver:
         pl_y = self._var(op.output_name)
         for d in range(len(gs_x)):
             self.solver.add(gs_y[d] == gs_x[d])
-        self._add_local_shape_constraints(gs_y, ls_y, pl_y, tp)
+        self._add_local_shape_constraints(gs_y, ls_y, pl_y, mesh_sizes)
 
-    def _encode_shape_collective_preserve(self, op, tp):
-        """Shape constraint for collectives that preserve global shape (AllReduce, Broadcast)."""
+    def _encode_shape_collective_preserve(self, op, mesh_sizes):
+        """Shape constraint for collectives that preserve global shape (AllReduce, Broadcast).
+
+        After AllReduce/Broadcast, output is Replicate → local == global.
+        """
         if op.x not in self._shape_vars:
             return
         gs_x = self._shape_vars[op.x]
@@ -693,28 +783,36 @@ class Z3PlacementSolver:
             self.solver.add(gs_y[d] == gs_x[d])
             self.solver.add(ls_y[d] == gs_y[d])
 
-    def encode_shape_constraints(self, program: Program, tp_size: int):
+    def encode_shape_constraints(self, program: Program, tp_size: int = 0,
+                                  mesh_sizes: Optional[List[int]] = None):
         """Add Z3 constraints for shape correctness (L1).
 
-        (a) Divisibility: sharded dims must be divisible by tp_size
-        (b) Local shape:  local = global / tp if sharded, else global
+        (a) Divisibility: sharded dims must be divisible by mesh size on that dim
+        (b) Local shape:  local = global / divisor (product of sharding mesh sizes)
         (c) MatMul:       a.global_cols == b.global_rows  (contraction dim)
         (d) MatMul out:   out.rows == a.rows, out.cols == b.cols
         (e) Add/Mul:      a.global_shape == b.global_shape
+
+        Args:
+            tp_size: single mesh dim size (backward compat, used when mesh_sizes is None)
+            mesh_sizes: per-mesh-dim sizes [s0, s1, ...] for multi-dim
         """
-        self._tp_size = tp_size
+        if mesh_sizes is None:
+            mesh_sizes = [tp_size] if tp_size > 0 else [2]
+        self._tp_size = mesh_sizes[0]
+        self._mesh_sizes = mesh_sizes
         S0, S1 = IntVal(PL_S0), IntVal(PL_S1)
-        tp = IntVal(tp_size)
 
         for name in list(self._shape_vars.keys()):
             gs, ls = self._shape_vars[name], self._local_vars[name]
-            pl = self._var(name)
-            for d in range(len(gs)):
-                if d == 0:
-                    self.solver.add(Implies(pl == S0, gs[d] % tp == 0))
-                elif d == 1:
-                    self.solver.add(Implies(pl == S1, gs[d] % tp == 0))
-            self._add_local_shape_constraints(gs, ls, pl, tp)
+            pl_vs = self._var(name)
+            # Divisibility: for each mesh dim m, if pl_m == Shard(d), gs[d] must be divisible
+            for m in range(min(len(pl_vs), len(mesh_sizes))):
+                ms = IntVal(mesh_sizes[m])
+                for d in range(len(gs)):
+                    shard_pl = PL_S0 if d == 0 else PL_S1
+                    self.solver.add(Implies(pl_vs[m] == IntVal(shard_pl), gs[d] % ms == 0))
+            self._add_local_shape_constraints(gs, ls, pl_vs, mesh_sizes)
 
         for op in program.ops:
             if isinstance(op, MatMul):
@@ -727,7 +825,7 @@ class Z3PlacementSolver:
                 self.solver.add(gs_a[1] == gs_b[0])
                 self.solver.add(gs_y[0] == gs_a[0])
                 self.solver.add(gs_y[1] == gs_b[1])
-                self._add_local_shape_constraints(gs_y, ls_y, pl_y, tp)
+                self._add_local_shape_constraints(gs_y, ls_y, pl_y, mesh_sizes)
 
             elif isinstance(op, ElementWiseBinaryOp):
                 if op.a not in self._shape_vars or op.b not in self._shape_vars:
@@ -740,7 +838,7 @@ class Z3PlacementSolver:
                 pl_y = self._var(op.output)
                 for d in range(min(len(gs_a), len(gs_y))):
                     self.solver.add(gs_y[d] == gs_a[d])
-                self._add_local_shape_constraints(gs_y, ls_y, pl_y, tp)
+                self._add_local_shape_constraints(gs_y, ls_y, pl_y, mesh_sizes)
 
             elif isinstance(op, FlashAttention):
                 gs_y, ls_y = self._shape_var(op.output)
@@ -748,16 +846,19 @@ class Z3PlacementSolver:
                 if op.q in self._shape_vars:
                     gs_q = self._shape_vars[op.q]
                     self.solver.add(gs_y[0] == gs_q[0])
-                self._add_local_shape_constraints(gs_y, ls_y, pl_y, tp)
+                self._add_local_shape_constraints(gs_y, ls_y, pl_y, mesh_sizes)
 
             elif isinstance(op, (AllReduce, Broadcast, Reduce)):
-                self._encode_shape_collective_preserve(op, tp)
+                self._encode_shape_collective_preserve(op, mesh_sizes)
 
             elif isinstance(op, AllGather):
                 if op.x not in self._shape_vars:
                     continue
                 gs_x = self._shape_vars[op.x]
                 gs_y, ls_y = self._shape_var(op.output)
+                # AllGather on gather_dim multiplies by the mesh size on first dim
+                # (the collective operates on the mesh dim where input is sharded)
+                tp = IntVal(mesh_sizes[0])
                 for d in range(len(gs_x)):
                     if d == op.gather_dim:
                         self.solver.add(gs_y[d] == gs_x[d] * tp)
@@ -773,7 +874,7 @@ class Z3PlacementSolver:
                 pl_y = self._var(op.output)
                 for d in range(len(gs_x)):
                     self.solver.add(gs_y[d] == gs_x[d])
-                self._add_local_shape_constraints(gs_y, ls_y, pl_y, tp)
+                self._add_local_shape_constraints(gs_y, ls_y, pl_y, mesh_sizes)
 
             elif isinstance(op, AllToAll):
                 if op.x not in self._shape_vars:
@@ -783,7 +884,7 @@ class Z3PlacementSolver:
                 pl_y = self._var(op.output)
                 for d in range(len(gs_x)):
                     self.solver.add(gs_y[d] == gs_x[d])
-                self._add_local_shape_constraints(gs_y, ls_y, pl_y, tp)
+                self._add_local_shape_constraints(gs_y, ls_y, pl_y, mesh_sizes)
 
             elif isinstance(op, Scatter):
                 if op.x not in self._shape_vars:
@@ -793,13 +894,14 @@ class Z3PlacementSolver:
                 pl_y = self._var(op.output)
                 for d in range(len(gs_x)):
                     self.solver.add(gs_y[d] == gs_x[d])
-                self._add_local_shape_constraints(gs_y, ls_y, pl_y, tp)
+                self._add_local_shape_constraints(gs_y, ls_y, pl_y, mesh_sizes)
 
             elif isinstance(op, Gather):
                 if op.x not in self._shape_vars:
                     continue
                 gs_x = self._shape_vars[op.x]
                 gs_y, ls_y = self._shape_var(op.output)
+                tp = IntVal(mesh_sizes[0])
                 for d in range(len(gs_x)):
                     if d == op.gather_dim:
                         self.solver.add(gs_y[d] == gs_x[d] * tp)
@@ -812,7 +914,7 @@ class Z3PlacementSolver:
                                  Cast, LossScale, Reshape, Transpose,
                                  FP8Quantize, FP8Dequantize,
                                  Reinterpret, Convert)):
-                self._encode_shape_passthrough(op, tp)
+                self._encode_shape_passthrough(op, mesh_sizes)
 
             elif isinstance(op, Embedding):
                 if op.weight not in self._shape_vars:
@@ -822,7 +924,7 @@ class Z3PlacementSolver:
                 pl_y = self._var(op.output)
                 if len(gs_w) >= 2:
                     self.solver.add(gs_y[1] == gs_w[1])
-                self._add_local_shape_constraints(gs_y, ls_y, pl_y, tp)
+                self._add_local_shape_constraints(gs_y, ls_y, pl_y, mesh_sizes)
 
             elif isinstance(op, CrossEntropyLoss):
                 gs_y, ls_y = self._shape_var(op.output)
@@ -849,53 +951,62 @@ class Z3PlacementSolver:
             ))
         self.solver.pop()
 
-        # Check individual properties
-        if self._tp_size and self._shape_vars:
-            tp = IntVal(self._tp_size)
+        mesh_sizes = self._mesh_sizes or ([self._tp_size] if self._tp_size else None)
+        if mesh_sizes and self._shape_vars:
             for name in self._shape_vars:
-                pl = self._vars.get(name)
+                pl_vs = self._vars.get(name)
                 gs = self._shape_vars[name]
-                if pl is None:
+                if pl_vs is None:
                     continue
-                # Check divisibility for each possible shard dim
-                for d, shard_pl in [(0, PL_S0), (1, PL_S1)]:
-                    if d >= len(gs):
-                        continue
-                    self.solver.push()
-                    self.solver.add(pl == shard_pl)
-                    self.solver.add(gs[d] % tp != 0)
-                    check = self.solver.check()
-                    if check == sat:
-                        model = self.solver.model()
-                        dim_val = model.eval(gs[d], model_completion=True).as_long()
-                        results.append(VerifyResult(
-                            passed=False,
-                            condition=f"divisibility({name}, dim={d})",
-                            details=(
-                                f"Shard(dim={d}) on '{name}' but dim size "
-                                f"{dim_val} not divisible by TP={self._tp_size}"
-                            ),
-                        ))
-                    else:
-                        results.append(VerifyResult(
-                            passed=True,
-                            condition=f"divisibility({name}, dim={d})",
-                            details=f"'{name}' dim {d} always divisible when sharded",
-                        ))
-                    self.solver.pop()
+                # Check divisibility for each mesh dim × tensor dim combination
+                for m in range(min(len(pl_vs), len(mesh_sizes))):
+                    ms = IntVal(mesh_sizes[m])
+                    for d, shard_pl in [(0, PL_S0), (1, PL_S1)]:
+                        if d >= len(gs):
+                            continue
+                        self.solver.push()
+                        self.solver.add(pl_vs[m] == IntVal(shard_pl))
+                        self.solver.add(gs[d] % ms != 0)
+                        check = self.solver.check()
+                        if check == sat:
+                            model = self.solver.model()
+                            dim_val = model.eval(gs[d], model_completion=True).as_long()
+                            label = f"mesh_dim={m}" if len(mesh_sizes) > 1 else ""
+                            results.append(VerifyResult(
+                                passed=False,
+                                condition=f"divisibility({name}, dim={d}{', ' + label if label else ''})",
+                                details=(
+                                    f"Shard(dim={d}) on '{name}' but dim size "
+                                    f"{dim_val} not divisible by {mesh_sizes[m]}"
+                                ),
+                            ))
+                        else:
+                            results.append(VerifyResult(
+                                passed=True,
+                                condition=f"divisibility({name}, dim={d})",
+                                details=f"'{name}' dim {d} always divisible when sharded",
+                            ))
+                        self.solver.pop()
 
         return results
 
     # ── L2: Slice alignment ─────────────────────────────────────────────────
 
-    def encode_slice_constraints(self, program: Program, tp_size: int):
+    def encode_slice_constraints(self, program: Program, tp_size: int = 0,
+                                  mesh_sizes: Optional[List[int]] = None):
         """Add Z3 constraints for per-device slice alignment (L2).
 
         For MatMul(A, B) with A sharded on cols and B sharded on rows,
         verifies that on each device d, A's column slice and B's row slice
         cover the same interval of the contraction dimension.
+
+        Slice alignment is checked per mesh dim — sharding on different mesh
+        dims produces independent slicing along the same tensor dim.
         """
-        self._tp_size = tp_size
+        if mesh_sizes is None:
+            mesh_sizes = [tp_size] if tp_size > 0 else [2]
+        self._tp_size = mesh_sizes[0]
+        self._mesh_sizes = mesh_sizes
 
         for op in program.ops:
             if not isinstance(op, MatMul):
@@ -903,35 +1014,35 @@ class Z3PlacementSolver:
             if op.a not in self._shape_vars or op.b not in self._shape_vars:
                 continue
 
-            pl_a = self._vars.get(op.a)
-            pl_b = self._vars.get(op.b)
+            pl_a_vs = self._vars.get(op.a)
+            pl_b_vs = self._vars.get(op.b)
             gs_a = self._shape_vars[op.a]
             gs_b = self._shape_vars[op.b]
-            if pl_a is None or pl_b is None:
+            if pl_a_vs is None or pl_b_vs is None:
                 continue
 
             S0, S1 = IntVal(PL_S0), IntVal(PL_S1)
-            tp = IntVal(tp_size)
 
-            # When both A and B are sharded on the contraction dim
-            # (A: Shard(1), B: Shard(0)), verify slice alignment per device
-            for d in range(tp_size):
-                d_val = IntVal(d)
-                # A column slice: offset = d * (A_cols / tp), width = A_cols / tp
-                a_col_offset = d_val * (gs_a[1] / tp)
-                a_col_width = gs_a[1] / tp
-                # B row slice: offset = d * (B_rows / tp), width = B_rows / tp
-                b_row_offset = d_val * (gs_b[0] / tp)
-                b_row_width = gs_b[0] / tp
+            # Check slice alignment per mesh dim
+            for m in range(min(len(pl_a_vs), len(mesh_sizes))):
+                tp = IntVal(mesh_sizes[m])
+                pl_a = pl_a_vs[m]
+                pl_b = pl_b_vs[m]
 
-                # When A=S(1) and B=S(0): slices must align
-                self.solver.add(Implies(
-                    And(pl_a == S1, pl_b == S0),
-                    And(
-                        a_col_offset == b_row_offset,
-                        a_col_width == b_row_width,
-                    )
-                ))
+                for d in range(mesh_sizes[m]):
+                    d_val = IntVal(d)
+                    a_col_offset = d_val * (gs_a[1] / tp)
+                    a_col_width = gs_a[1] / tp
+                    b_row_offset = d_val * (gs_b[0] / tp)
+                    b_row_width = gs_b[0] / tp
+
+                    self.solver.add(Implies(
+                        And(pl_a == S1, pl_b == S0),
+                        And(
+                            a_col_offset == b_row_offset,
+                            a_col_width == b_row_width,
+                        )
+                    ))
 
     def check_slice_alignment(self, program: Program) -> List[VerifyResult]:
         """Verify per-device slice alignment for all MatMul ops.
@@ -1331,8 +1442,17 @@ class DistributedVerifier:
 
         Encodes all op propagation rules as Z3 constraints and checks
         that output tensors are always Replicate (single-GPU equivalent).
+        Automatically detects mesh dimensionality from tensor states.
         """
-        z3s = Z3PlacementSolver()
+        # Determine mesh_ndim from tensors
+        mesh_ndim = 1
+        if final_tensors:
+            for ts in final_tensors.values():
+                if ts.sharding and ts.sharding.mesh:
+                    mesh_ndim = max(mesh_ndim, len(ts.sharding.mesh.shape))
+                    break
+
+        z3s = Z3PlacementSolver(mesh_ndim=mesh_ndim)
 
         if input_placements:
             for name, pl in input_placements.items():
@@ -1344,7 +1464,10 @@ class DistributedVerifier:
             for name in pure_inputs:
                 ts = final_tensors.get(name)
                 if ts and ts.sharding.placements:
-                    z3s.add_input(name, ts.sharding.placements[0])
+                    if len(ts.sharding.placements) > 1:
+                        z3s.add_input(name, tuple(ts.sharding.placements))
+                    else:
+                        z3s.add_input(name, ts.sharding.placements[0])
 
         z3s.encode_program(program)
 
@@ -1532,26 +1655,31 @@ class DistributedVerifier:
         final_tensors: Dict[str, TensorState],
     ):
         """Run Z3-based shape consistency and slice alignment checks."""
-        tp_size = None
+        mesh_sizes = None
+        mesh_ndim = 1
         for ts in final_tensors.values():
-            if ts.sharding and ts.sharding.mesh:
-                tp_size = ts.sharding.mesh.shape[0] if ts.sharding.mesh.shape else None
+            if ts.sharding and ts.sharding.mesh and ts.sharding.mesh.shape:
+                mesh_sizes = list(ts.sharding.mesh.shape)
+                mesh_ndim = len(mesh_sizes)
                 break
 
-        if tp_size is None or tp_size < 2:
+        if mesh_sizes is None or all(s < 2 for s in mesh_sizes):
             self.verify_shape_consistency(program, initial_shapes, final_tensors)
             return
 
-        z3s = Z3PlacementSolver()
+        z3s = Z3PlacementSolver(mesh_ndim=mesh_ndim)
         for name, shape in initial_shapes.items():
             z3s.add_input_shape(name, shape)
             ts = final_tensors.get(name)
             if ts and ts.sharding and ts.sharding.placements:
-                z3s.add_input(name, ts.sharding.placements[0])
+                if len(ts.sharding.placements) > 1:
+                    z3s.add_input(name, tuple(ts.sharding.placements))
+                else:
+                    z3s.add_input(name, ts.sharding.placements[0])
 
         z3s.encode_program(program)
-        z3s.encode_shape_constraints(program, tp_size)
-        z3s.encode_slice_constraints(program, tp_size)
+        z3s.encode_shape_constraints(program, mesh_sizes=mesh_sizes)
+        z3s.encode_slice_constraints(program, mesh_sizes=mesh_sizes)
 
         shape_results = z3s.check_shape_consistency()
         slice_results = z3s.check_slice_alignment(program)

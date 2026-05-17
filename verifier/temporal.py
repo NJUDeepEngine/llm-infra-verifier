@@ -81,6 +81,7 @@ class RaceType(Enum):
     BUFFER_ALIASING = "buffer_aliasing"
     DEPENDENCY_VIOLATION = "dependency_violation"
     CONCURRENT_COLLECTIVES = "concurrent_collectives"
+    ORPHANED_HANDLE = "orphaned_handle"
 
 
 @dataclass
@@ -333,6 +334,7 @@ class RaceDetector:
         self.detect_buffer_aliasing()
         self.detect_dependency_violations()
         self.detect_concurrent_collectives()
+        self.detect_orphaned_handles()
         return self.reports
 
     def _is_sync_op(self, event: TemporalEvent) -> bool:
@@ -555,6 +557,47 @@ class RaceDetector:
                         ),
                     ))
 
+    def detect_orphaned_handles(self):
+        """Detect async ops whose handles are never waited on.
+
+        An orphaned handle means the async result is never synchronized,
+        which is usually a bug — the program proceeds without knowing
+        whether the async operation completed.
+        """
+        events = self.graph.events
+
+        # Collect all handles that have a Wait
+        waited_handles: Set[str] = set()
+        for event in events:
+            if isinstance(event.op, Wait):
+                waited_handles.add(event.op.handle)
+            elif isinstance(event.op, WaitAll):
+                waited_handles.update(event.op.handles)
+
+        # Find async ops with no Wait
+        for i, event in enumerate(events):
+            if not event.op.is_async():
+                continue
+            if event.handle is None:
+                continue
+            if event.handle in waited_handles:
+                continue
+
+            self.reports.append(RaceReport(
+                race_type=RaceType.ORPHANED_HANDLE,
+                description=(
+                    f"Orphaned handle: async op[{i}]={type(event.op).__name__} "
+                    f"creates handle '{event.handle}' that is never waited on"
+                ),
+                op_a_idx=i, op_b_idx=i,
+                tensor_name=event.op.output_name or "",
+                details=(
+                    f"Handle '{event.handle}' from {type(event.op).__name__} "
+                    f"has no matching Wait/WaitAll. The async result may never "
+                    f"be consumed safely."
+                ),
+            ))
+
     def summary(self) -> str:
         if not self.reports:
             return "No temporal violations detected."
@@ -596,6 +639,10 @@ class TemporalVerifyResult:
     def num_concurrent_collectives(self) -> int:
         return sum(1 for r in self.reports if r.race_type == RaceType.CONCURRENT_COLLECTIVES)
 
+    @property
+    def num_orphaned_handles(self) -> int:
+        return sum(1 for r in self.reports if r.race_type == RaceType.ORPHANED_HANDLE)
+
     def summary(self) -> str:
         status = "SAFE" if self.is_safe else "UNSAFE"
         lines = [
@@ -614,6 +661,8 @@ class TemporalVerifyResult:
             lines.append(f"    Dependency violations: {self.num_dep_violations}")
         if self.num_concurrent_collectives:
             lines.append(f"    Concurrent collectives: {self.num_concurrent_collectives}")
+        if self.num_orphaned_handles:
+            lines.append(f"    Orphaned handles: {self.num_orphaned_handles}")
         for r in self.reports:
             lines.append(f"\n  {r}")
         return "\n".join(lines)
