@@ -114,11 +114,18 @@ class MoEDispatch(CollectiveOp):
     split_dim: int
     concat_dim: int
     expert_capacity: Optional[int] = None
+    mesh_dim: Optional[int] = None
 
     def propagate_spmd_type(self, input_types):
         return LocalSPMDType.VARYING
 
     def _transform_placements(self, placements, x):
+        if self.mesh_dim is not None:
+            result = list(placements)
+            p = result[self.mesh_dim]
+            if isinstance(p, Shard) and p.dim == self.split_dim:
+                result[self.mesh_dim] = Shard(dim=self.concat_dim)
+            return tuple(result)
         return tuple(
             Shard(dim=self.concat_dim) if isinstance(p, Shard) and p.dim == self.split_dim else p
             for p in placements
@@ -141,14 +148,15 @@ class MoEDispatch(CollectiveOp):
             x=input_map.get(self.x, self.x), output=output_name,
             num_experts=self.num_experts,
             split_dim=self.split_dim, concat_dim=self.concat_dim,
-            expert_capacity=self.expert_capacity,
+            expert_capacity=self.expert_capacity, mesh_dim=self.mesh_dim,
         )
 
     def __repr__(self):
         cap = f", cap={self.expert_capacity}" if self.expert_capacity else ""
+        dim_str = f", mesh_dim={self.mesh_dim}" if self.mesh_dim is not None else ""
         return (
             f"MoEDispatch({self.x}, experts={self.num_experts}, "
-            f"split={self.split_dim}->concat={self.concat_dim}{cap}) -> {self.output}"
+            f"split={self.split_dim}->concat={self.concat_dim}{cap}{dim_str}) -> {self.output}"
         )
 
 
@@ -164,11 +172,18 @@ class MoECombine(CollectiveOp):
     num_experts: int
     split_dim: int
     concat_dim: int
+    mesh_dim: Optional[int] = None
 
     def propagate_spmd_type(self, input_types):
         return LocalSPMDType.VARYING
 
     def _transform_placements(self, placements, x):
+        if self.mesh_dim is not None:
+            result = list(placements)
+            p = result[self.mesh_dim]
+            if isinstance(p, Shard) and p.dim == self.split_dim:
+                result[self.mesh_dim] = Shard(dim=self.concat_dim)
+            return tuple(result)
         return tuple(
             Shard(dim=self.concat_dim) if isinstance(p, Shard) and p.dim == self.split_dim else p
             for p in placements
@@ -185,12 +200,14 @@ class MoECombine(CollectiveOp):
             x=input_map.get(self.x, self.x), output=output_name,
             num_experts=self.num_experts,
             split_dim=self.split_dim, concat_dim=self.concat_dim,
+            mesh_dim=self.mesh_dim,
         )
 
     def __repr__(self):
+        dim_str = f", mesh_dim={self.mesh_dim}" if self.mesh_dim is not None else ""
         return (
             f"MoECombine({self.x}, experts={self.num_experts}, "
-            f"split={self.split_dim}->concat={self.concat_dim}) -> {self.output}"
+            f"split={self.split_dim}->concat={self.concat_dim}{dim_str}) -> {self.output}"
         )
 
 

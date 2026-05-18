@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .base import IROp
 from ..state import (
@@ -10,6 +10,7 @@ from ..state import (
     Partial,
     Replicate,
     ShardingSpec,
+    compute_local_shape,
 )
 
 
@@ -59,6 +60,7 @@ class AllReduceAsync(IROp):
     handle: str
     op_type: str = "sum"
     stream: Stream = COMM_STREAM
+    mesh_dim: Optional[int] = None
 
     @property
     def input_names(self) -> List[str]:
@@ -80,16 +82,21 @@ class AllReduceAsync(IROp):
                 f"local_shape={x.local_shape}). "
                 f"Op: AllReduceAsync({self.x}) -> {self.output}"
             )
-        new_placements = []
-        for p in x.sharding.placements:
-            if isinstance(p, Partial):
-                new_placements.append(Replicate())
-            else:
-                new_placements.append(p)
-        out_spec = ShardingSpec(placements=tuple(new_placements), mesh=x.sharding.mesh)
+        if self.mesh_dim is not None:
+            new_placements = list(x.sharding.placements)
+            if isinstance(new_placements[self.mesh_dim], Partial):
+                new_placements[self.mesh_dim] = Replicate()
+            new_placements = tuple(new_placements)
+        else:
+            new_placements = tuple(
+                Replicate() if isinstance(p, Partial) else p
+                for p in x.sharding.placements
+            )
+        out_spec = ShardingSpec(placements=new_placements, mesh=x.sharding.mesh)
+        out_local = compute_local_shape(x.global_shape, out_spec)
         result = TensorState(
             name=self.output, global_shape=x.global_shape,
-            local_shape=x.global_shape, sharding=out_spec,
+            local_shape=out_local, sharding=out_spec,
             dtype=x.dtype,
             expr=x.expr, requires_grad=x.requires_grad,
             grad_name=f"grad_{self.output}",
@@ -116,10 +123,12 @@ class AllReduceAsync(IROp):
         return AllReduceAsync(
             x=input_map.get(self.x, self.x), output=output_name,
             handle=self.handle, op_type=self.op_type, stream=self.stream,
+            mesh_dim=self.mesh_dim,
         )
 
     def __repr__(self):
-        return f"AllReduceAsync({self.x}, {self.op_type}) -> {self.output} [handle={self.handle}]"
+        dim_str = f", mesh_dim={self.mesh_dim}" if self.mesh_dim is not None else ""
+        return f"AllReduceAsync({self.x}, {self.op_type}{dim_str}) -> {self.output} [handle={self.handle}]"
 
 
 @dataclass

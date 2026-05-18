@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .base import IROp
 from .spmd import SPMDGuard
@@ -97,6 +97,7 @@ class AllReduce(CollectiveOp):
     x: str
     output: str
     op_type: str = "sum"
+    mesh_dim: Optional[int] = None
 
     def _validate(self, x: TensorState) -> None:
         if not x.partial:
@@ -116,6 +117,11 @@ class AllReduce(CollectiveOp):
         return LocalSPMDType.REPLICATE
 
     def _transform_placements(self, placements, x):
+        if self.mesh_dim is not None:
+            result = list(placements)
+            if isinstance(result[self.mesh_dim], Partial):
+                result[self.mesh_dim] = Replicate()
+            return tuple(result)
         return tuple(Replicate() if isinstance(p, Partial) else p for p in placements)
 
     def vjp(self, ctx, grad_output):
@@ -126,11 +132,13 @@ class AllReduce(CollectiveOp):
 
     def clone_with_names(self, input_map, output_name):
         return AllReduce(
-            x=input_map.get(self.x, self.x), output=output_name, op_type=self.op_type,
+            x=input_map.get(self.x, self.x), output=output_name,
+            op_type=self.op_type, mesh_dim=self.mesh_dim,
         )
 
     def __repr__(self):
-        return f"AllReduce({self.x}, {self.op_type}) -> {self.output}"
+        dim_str = f", mesh_dim={self.mesh_dim}" if self.mesh_dim is not None else ""
+        return f"AllReduce({self.x}, {self.op_type}{dim_str}) -> {self.output}"
 
 
 @dataclass
@@ -143,11 +151,18 @@ class AllGather(CollectiveOp):
     x: str
     output: str
     gather_dim: int
+    mesh_dim: Optional[int] = None
 
     def propagate_spmd_type(self, input_types):
         return LocalSPMDType.REPLICATE
 
     def _transform_placements(self, placements, x):
+        if self.mesh_dim is not None:
+            result = list(placements)
+            p = result[self.mesh_dim]
+            if isinstance(p, Shard) and p.dim == self.gather_dim:
+                result[self.mesh_dim] = Replicate()
+            return tuple(result)
         return tuple(
             Replicate() if isinstance(p, Shard) and p.dim == self.gather_dim else p
             for p in placements
@@ -162,11 +177,12 @@ class AllGather(CollectiveOp):
     def clone_with_names(self, input_map, output_name):
         return AllGather(
             x=input_map.get(self.x, self.x), output=output_name,
-            gather_dim=self.gather_dim,
+            gather_dim=self.gather_dim, mesh_dim=self.mesh_dim,
         )
 
     def __repr__(self):
-        return f"AllGather({self.x}, dim={self.gather_dim}) -> {self.output}"
+        dim_str = f", mesh_dim={self.mesh_dim}" if self.mesh_dim is not None else ""
+        return f"AllGather({self.x}, dim={self.gather_dim}{dim_str}) -> {self.output}"
 
 
 @dataclass
@@ -180,11 +196,18 @@ class ReduceScatter(CollectiveOp):
     output: str
     scatter_dim: int
     op_type: str = "sum"
+    mesh_dim: Optional[int] = None
 
     def propagate_spmd_type(self, input_types):
         return LocalSPMDType.VARYING
 
     def _transform_placements(self, placements, x):
+        if self.mesh_dim is not None:
+            result = list(placements)
+            p = result[self.mesh_dim]
+            if isinstance(p, (Replicate, Partial)):
+                result[self.mesh_dim] = Shard(dim=self.scatter_dim)
+            return tuple(result)
         result = []
         found = False
         for p in placements:
@@ -197,10 +220,17 @@ class ReduceScatter(CollectiveOp):
 
     def vjp(self, ctx, grad_output):
         x = ctx[self.x]
-        out_placements = tuple(
-            Replicate() if isinstance(p, (Replicate, Partial)) else p
-            for p in x.sharding.placements
-        )
+        if self.mesh_dim is not None:
+            out_placements = list(x.sharding.placements)
+            p = out_placements[self.mesh_dim]
+            if isinstance(p, (Replicate, Partial)):
+                out_placements[self.mesh_dim] = Replicate()
+            out_placements = tuple(out_placements)
+        else:
+            out_placements = tuple(
+                Replicate() if isinstance(p, (Replicate, Partial)) else p
+                for p in x.sharding.placements
+            )
         grad_spec = ShardingSpec(placements=out_placements, mesh=x.sharding.mesh)
         grad_x = TensorState(
             name=f"grad_{self.x}",
@@ -216,10 +246,12 @@ class ReduceScatter(CollectiveOp):
         return ReduceScatter(
             x=input_map.get(self.x, self.x), output=output_name,
             scatter_dim=self.scatter_dim, op_type=self.op_type,
+            mesh_dim=self.mesh_dim,
         )
 
     def __repr__(self):
-        return f"ReduceScatter({self.x}, dim={self.scatter_dim}) -> {self.output}"
+        dim_str = f", mesh_dim={self.mesh_dim}" if self.mesh_dim is not None else ""
+        return f"ReduceScatter({self.x}, dim={self.scatter_dim}{dim_str}) -> {self.output}"
 
 
 @dataclass
@@ -312,11 +344,18 @@ class AllToAll(CollectiveOp):
     output: str
     split_dim: int
     concat_dim: int
+    mesh_dim: Optional[int] = None
 
     def propagate_spmd_type(self, input_types):
         return LocalSPMDType.VARYING
 
     def _transform_placements(self, placements, x):
+        if self.mesh_dim is not None:
+            result = list(placements)
+            p = result[self.mesh_dim]
+            if isinstance(p, Shard) and p.dim == self.split_dim:
+                result[self.mesh_dim] = Shard(dim=self.concat_dim)
+            return tuple(result)
         return tuple(
             Shard(dim=self.concat_dim) if isinstance(p, Shard) and p.dim == self.split_dim else p
             for p in placements
@@ -332,10 +371,12 @@ class AllToAll(CollectiveOp):
         return AllToAll(
             x=input_map.get(self.x, self.x), output=output_name,
             split_dim=self.split_dim, concat_dim=self.concat_dim,
+            mesh_dim=self.mesh_dim,
         )
 
     def __repr__(self):
-        return f"AllToAll({self.x}, split={self.split_dim}, concat={self.concat_dim}) -> {self.output}"
+        dim_str = f", mesh_dim={self.mesh_dim}" if self.mesh_dim is not None else ""
+        return f"AllToAll({self.x}, split={self.split_dim}, concat={self.concat_dim}{dim_str}) -> {self.output}"
 
 
 @dataclass
@@ -349,11 +390,17 @@ class Scatter(CollectiveOp):
     output: str
     scatter_dim: int
     root: int = 0
+    mesh_dim: Optional[int] = None
 
     def propagate_spmd_type(self, input_types):
         return LocalSPMDType.VARYING
 
     def _transform_placements(self, placements, x):
+        if self.mesh_dim is not None:
+            result = list(placements)
+            if isinstance(result[self.mesh_dim], Replicate):
+                result[self.mesh_dim] = Shard(dim=self.scatter_dim)
+            return tuple(result)
         result = []
         replaced = False
         for p in placements:
@@ -374,10 +421,12 @@ class Scatter(CollectiveOp):
         return Scatter(
             x=input_map.get(self.x, self.x), output=output_name,
             scatter_dim=self.scatter_dim, root=self.root,
+            mesh_dim=self.mesh_dim,
         )
 
     def __repr__(self):
-        return f"Scatter({self.x}, dim={self.scatter_dim}, root={self.root}) -> {self.output}"
+        dim_str = f", mesh_dim={self.mesh_dim}" if self.mesh_dim is not None else ""
+        return f"Scatter({self.x}, dim={self.scatter_dim}, root={self.root}{dim_str}) -> {self.output}"
 
 
 @dataclass
@@ -391,11 +440,18 @@ class Gather(CollectiveOp):
     output: str
     gather_dim: int
     root: int = 0
+    mesh_dim: Optional[int] = None
 
     def propagate_spmd_type(self, input_types):
         return LocalSPMDType.REPLICATE
 
     def _transform_placements(self, placements, x):
+        if self.mesh_dim is not None:
+            result = list(placements)
+            p = result[self.mesh_dim]
+            if isinstance(p, Shard) and p.dim == self.gather_dim:
+                result[self.mesh_dim] = Replicate()
+            return tuple(result)
         return tuple(
             Replicate() if isinstance(p, Shard) and p.dim == self.gather_dim else p
             for p in placements
@@ -411,7 +467,9 @@ class Gather(CollectiveOp):
         return Gather(
             x=input_map.get(self.x, self.x), output=output_name,
             gather_dim=self.gather_dim, root=self.root,
+            mesh_dim=self.mesh_dim,
         )
 
     def __repr__(self):
-        return f"Gather({self.x}, dim={self.gather_dim}, root={self.root}) -> {self.output}"
+        dim_str = f", mesh_dim={self.mesh_dim}" if self.mesh_dim is not None else ""
+        return f"Gather({self.x}, dim={self.gather_dim}, root={self.root}{dim_str}) -> {self.output}"

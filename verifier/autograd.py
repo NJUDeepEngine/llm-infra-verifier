@@ -212,6 +212,7 @@ class AutogradEngine:
                     x=grad_tensor.name,
                     output=f"{grad_tensor.name}_reduced",
                     op_type=op.op_type,
+                    mesh_dim=op.mesh_dim,
                 )
 
         elif isinstance(op, AllGather):
@@ -223,6 +224,7 @@ class AutogradEngine:
                     x=grad_tensor.name,
                     output=f"{grad_tensor.name}_scattered",
                     scatter_dim=op.gather_dim,
+                    mesh_dim=op.mesh_dim,
                 )
 
         elif isinstance(op, ReduceScatter):
@@ -234,6 +236,7 @@ class AutogradEngine:
                     x=grad_tensor.name,
                     output=f"{grad_tensor.name}_gathered",
                     gather_dim=op.scatter_dim,
+                    mesh_dim=op.mesh_dim,
                 )
 
         elif isinstance(op, Send):
