@@ -55,7 +55,7 @@ The system is built on five core principles:
     │ • Comm Legality  │           │ • Missing Wait    │
     │ • Gradient Dual  │           │ • Buffer Aliasing │
     │ • Placement Cons │           │ • Dep. Violation  │
-    │ • Shape Cons     │           │                   │
+    │ • Shape Cons     │           │ • Orphaned Handle │
     │ • PP Deadlock    │           │                   │
     └────────┬─────────┘           └────────┬─────────┘
              │                               │
@@ -79,8 +79,8 @@ The system is built on five core principles:
 | [`verifier/ir/`](modules#ir) | 48 IR ops across 10 sub-modules (compute, collective, p2p, async, shape, spmd, precision, zero, cp, moe) |
 | [`verifier/executor.py`](modules#executor) | Multi-device symbolic executor with registry-based dispatch |
 | [`verifier/autograd.py`](modules#autograd) | Formal VJP autograd engine + gradient duality verification |
-| [`verifier/solver.py`](modules#solver) | Z3 spatial verification (6 checks, 3 levels: L0 placement, L1 shape, L2 slice) |
-| [`verifier/temporal.py`](modules#temporal) | HB graph + Z3 temporal race detection (4 checks) |
+| [`verifier/solver.py`](modules#solver) | Z3 spatial verification (6 checks, 3 levels: L0 placement, L1 shape, L2 slice; multi-dim mesh aware) |
+| [`verifier/temporal.py`](modules#temporal) | HB graph + Z3 temporal race detection (5 checks, incl. orphaned handle) |
 | [`verifier/rewrite.py`](modules#rewrite) | Pattern matching, placement analysis, cost model, rewrite rules |
 | [`verifier/synthesis.py`](modules#synthesis) | Verified parallelization synthesis via beam search |
 | [`verifier/llm_frontend.py`](modules#llm-frontend) | PyTorch → IR with LLM + feedback refinement loop |
@@ -133,6 +133,7 @@ RaceDetector ──> For each pair of unordered ops on different streams:
                  - Async output read before Wait → MISSING WAIT
                  - Two async writes to same buffer → BUFFER ALIASING
                  - Recv before matching Send → DEPENDENCY VIOLATION
+                 - Async handle never waited on → ORPHANED HANDLE
 ```
 
 ## Key Abstractions

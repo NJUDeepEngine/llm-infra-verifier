@@ -944,3 +944,101 @@ class TestMeshDimCollectives:
         results = solver.check_collective_preconditions(program)
         # Should pass: dim 0 is Partial as required
         assert all(r.passed for r in results)
+
+
+# ── Wait / WaitAll solver encoding ──────────────────────────────────────────
+
+
+class TestWaitEncoding:
+    """Wait and WaitAll ops must be encoded as passthrough in the solver."""
+
+    def test_wait_passthrough_preserves_placement(self):
+        """AllReduceAsync → Wait: solver sees output as Replicate."""
+        prog = Program("wait_pt", ops=[
+            AllReduceAsync(x="x", output="y", handle="h1",
+                           stream=Stream("comm", 0)),
+            Wait(handle="h1", tensor="y", output="y_safe"),
+        ])
+        solver = Z3PlacementSolver()
+        solver.add_input("x", Partial())
+        solver.encode_program(prog)
+        eq = solver.check_output_equivalence(["y_safe"])
+        assert all(r.passed for r in eq), "Wait output should be Replicate"
+
+    def test_allreduce_async_wait_matmul_replicate(self):
+        """AllReduceAsync → Wait → MatMul: final output should be Replicate."""
+        prog = Program("async_wait_mm", ops=[
+            AllReduceAsync(x="x", output="y", handle="h1",
+                           stream=Stream("comm", 0)),
+            Wait(handle="h1", tensor="y", output="y_safe"),
+            MatMul(a="y_safe", b="w", output="z"),
+        ])
+        solver = Z3PlacementSolver()
+        solver.add_input("x", Partial())
+        solver.add_input("w", Replicate())
+        solver.encode_program(prog)
+        eq = solver.check_output_equivalence(["z"])
+        assert all(r.passed for r in eq), "MatMul(R, R) -> R"
+
+    def test_wait_without_async_is_passthrough(self):
+        """Wait on a non-async tensor just passes placement through."""
+        prog = Program("wait_plain", ops=[
+            MatMul(a="x", b="w", output="y"),
+            Wait(handle="h_fake", tensor="y", output="y_safe"),
+        ])
+        solver = Z3PlacementSolver()
+        solver.add_input("x", Shard(dim=0))
+        solver.add_input("w", Replicate())
+        solver.encode_program(prog)
+        eq = solver.check_output_equivalence(["y_safe"])
+        # MatMul(S0, R) -> S0, Wait passes S0 through
+        assert not all(r.passed for r in eq), "y_safe should be S0, not R"
+
+    def test_waitall_multi_output_passthrough(self):
+        """WaitAll maps each input tensor's placement to corresponding output."""
+        prog = Program("waitall_pt", ops=[
+            AllReduceAsync(x="a", output="a_r", handle="h1",
+                           stream=Stream("comm", 0)),
+            AllReduceAsync(x="b", output="b_r", handle="h2",
+                           stream=Stream("comm", 0)),
+            WaitAll(handles=["h1", "h2"], tensors=["a_r", "b_r"],
+                    outputs=["a_safe", "b_safe"]),
+            MatMul(a="a_safe", b="b_safe", output="z"),
+        ])
+        solver = Z3PlacementSolver()
+        solver.add_input("a", Partial())
+        solver.add_input("b", Partial())
+        solver.encode_program(prog)
+        eq = solver.check_output_equivalence(["z"])
+        assert all(r.passed for r in eq), "WaitAll outputs should be R"
+
+    def test_wait_2d_mesh_preserves_both_dims(self):
+        """Wait preserves placement on both mesh dims."""
+        prog = Program("wait_2d", ops=[
+            AllReduceAsync(x="x", output="y", handle="h1",
+                           stream=Stream("comm", 0), mesh_dim=0),
+            Wait(handle="h1", tensor="y", output="y_safe"),
+        ])
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        solver.add_input("x", (Partial(), Shard(dim=0)))
+        solver.encode_program(prog)
+        eq = solver.check_output_equivalence(["y_safe"])
+        # AllReduceAsync(mesh_dim=0): P→R on dim 0, S0 preserved on dim 1
+        # y_safe = (R, S0) — not fully Replicate
+        assert not all(r.passed for r in eq)
+
+    def test_waitall_shape_passthrough(self):
+        """WaitAll preserves shape constraints through to outputs."""
+        prog = Program("waitall_shape", ops=[
+            AllReduceAsync(x="a", output="a_r", handle="h1",
+                           stream=Stream("comm", 0)),
+            WaitAll(handles=["h1"], tensors=["a_r"], outputs=["a_safe"]),
+            MatMul(a="a_safe", b="w", output="z"),
+        ])
+        mesh = DeviceMesh(shape=(4,), dim_names=("tp",))
+        solver = Z3PlacementSolver()
+        solver.add_input("a", Partial())
+        solver.add_input("w", Replicate())
+        solver.encode_program(prog)
+        eq = solver.check_output_equivalence(["z"])
+        assert all(r.passed for r in eq)

@@ -146,7 +146,7 @@ python benchmarks/scaling_benchmark.py
 ## Run tests
 
 ```bash
-# All 531 tests
+# All 660 tests
 python -m pytest tests/ -v
 
 # Individual test files
@@ -159,4 +159,6 @@ python -m pytest tests/test_autograd.py -v
 python -m pytest tests/test_tir_lifter.py -v
 python -m pytest tests/test_schedules.py -v
 python -m pytest tests/test_real_world_bugs.py -v
+python -m pytest tests/test_solver_deep.py -v
+python -m pytest tests/test_temporal_ops.py -v
 ```

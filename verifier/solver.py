@@ -70,6 +70,8 @@ from .ir import (
     ExpertCompute,
     TopKGate,
     AllReduceAsync,
+    Wait,
+    WaitAll,
     OverlapRegion,
     Reinterpret,
     Convert,
@@ -226,6 +228,13 @@ class Z3PlacementSolver:
         for m in range(self._mesh_ndim):
             self.solver.add(y_vs[m] == x_vs[m])
 
+    def _encode_waitall(self, op):
+        """Encode WaitAll: each output passthrough from its corresponding input."""
+        for tensor, output in zip(op.tensors, op.outputs):
+            x_vs, y_vs = self._var(tensor), self._var(output)
+            for m in range(self._mesh_ndim):
+                self.solver.add(y_vs[m] == x_vs[m])
+
     def _encode_norm_op(self, op, norm_dim: int):
         """Encode norm op: output == input, with forbidden Shard(norm_dim) constraint."""
         x_name = op.input_names[0]
@@ -351,6 +360,10 @@ class Z3PlacementSolver:
                     self._encode_op_single(sub)
             elif isinstance(op, AllReduceAsync):
                 self._encode_collective_constrained(op, PL_R, op.mesh_dim)
+            elif isinstance(op, Wait):
+                self._encode_passthrough(op)
+            elif isinstance(op, WaitAll):
+                self._encode_waitall(op)
             elif isinstance(op, TopKGate):
                 self._encode_passthrough(op)
             elif isinstance(op, (MoEDispatch, MoECombine)):
@@ -944,8 +957,19 @@ class Z3PlacementSolver:
                                  LayerNorm, RMSNorm, Softmax,
                                  Cast, LossScale, Reshape, Transpose,
                                  FP8Quantize, FP8Dequantize,
-                                 Reinterpret, Convert)):
+                                 Reinterpret, Convert, Wait)):
                 self._encode_shape_passthrough(op, mesh_sizes)
+
+            elif isinstance(op, WaitAll):
+                for tensor, output in zip(op.tensors, op.outputs):
+                    if tensor not in self._shape_vars:
+                        continue
+                    gs_x = self._shape_vars[tensor]
+                    gs_y, ls_y = self._shape_var(output)
+                    pl_y = self._var(output)
+                    for d in range(len(gs_x)):
+                        self.solver.add(gs_y[d] == gs_x[d])
+                    self._add_local_shape_constraints(gs_y, ls_y, pl_y, mesh_sizes)
 
             elif isinstance(op, Embedding):
                 if op.weight not in self._shape_vars:

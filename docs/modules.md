@@ -82,16 +82,18 @@ Every `IROp` implements:
 
 ### `ir/collective.py` — NCCL Collectives (8)
 
+All collectives support `mesh_dim: Optional[int] = None` for multi-dim meshes. When set, only the targeted mesh dimension is transformed; other dimensions pass through.
+
 | Op | Forward | Backward Dual |
 |---|---|---|
-| `AllReduce(x, output)` | Partial → Replicate | AllReduce (self) |
-| `AllGather(x, output, dim)` | Shard(d) → Replicate | ReduceScatter |
-| `ReduceScatter(x, output, dim)` | R/P → Shard(d) | AllGather |
+| `AllReduce(x, output, mesh_dim)` | Partial → Replicate | AllReduce (self) |
+| `AllGather(x, output, dim, mesh_dim)` | Shard(d) → Replicate | ReduceScatter |
+| `ReduceScatter(x, output, dim, mesh_dim)` | R/P → Shard(d) | AllGather |
 | `Broadcast(x, output)` | any → Replicate | Reduce |
 | `Reduce(x, output)` | Partial → Replicate(root) | Broadcast |
-| `AllToAll(x, output, split_dim, concat_dim)` | Shard(split) → Shard(concat) | AllToAll (dim-swap) |
-| `Scatter(x, output, dim)` | Replicate → Shard(d) | Gather |
-| `Gather(x, output, dim)` | Shard(d) → Replicate | Scatter |
+| `AllToAll(x, output, split_dim, concat_dim, mesh_dim)` | Shard(split) → Shard(concat) | AllToAll (dim-swap) |
+| `Scatter(x, output, dim, mesh_dim)` | Replicate → Shard(d) | Gather |
+| `Gather(x, output, dim, mesh_dim)` | Shard(d) → Replicate | Scatter |
 
 ### `ir/p2p.py` — Point-to-Point (4)
 
@@ -196,7 +198,7 @@ check = autograd.verify_gradient_correctness(fwd, bwd_program)
 
 ### `verifier/solver.py` — Z3 Spatial Verifier (6 checks) {#solver}
 
-Encoding verification conditions as SMT formulas:
+Encoding verification conditions as SMT formulas. Supports multi-dimensional meshes (e.g. TP×DP) with per-dim Z3 variables and `mesh_dim`-aware collective encoding.
 
 ```python
 verifier = DistributedVerifier()
@@ -212,26 +214,36 @@ results = verifier.verify_all(program, final_tensors, bwd_program=bwd)
 print(verifier.summary())
 
 # Z3 placement solver (low-level)
-solver = Z3PlacementSolver(mesh)
-solver.encode_program(program, initial_placements)
+solver = Z3PlacementSolver(mesh_ndim=2)  # multi-dim mesh
+solver.add_input("x", (Partial(), Shard(dim=0)))
+solver.encode_program(program)
 result = solver.check()  # SAT/UNSAT
 ```
 
-### `verifier/temporal.py` — Temporal Verifier (4 checks) {#temporal}
+**Key features:**
+- Multi-dim mesh: N Z3 Int variables per tensor (one per mesh dimension)
+- `mesh_dim`-aware collectives: `AllReduce(mesh_dim=0)` transforms only dim 0, preserves others
+- Wait/WaitAll passthrough: async sync ops correctly propagate placements through Z3
+- Shape constraints respect `mesh_dim` targeting
+
+### `verifier/temporal.py` — Temporal Verifier (5 checks) {#temporal}
 
 Happens-Before analysis + Z3 race detection:
 
 ```python
-from verifier.temporal import verify_temporal, TemporalGraph, RaceDetector
+from verifier.temporal import verify_temporal, TemporalGraph, RaceDetector, RaceType
 
 result = verify_temporal(program)
 # result.is_safe, result.reports (list of RaceReport)
+# result.num_missing_waits, result.num_orphaned_handles
 
 # Low-level access
 graph = TemporalGraph(program)   # Build HB graph
 detector = RaceDetector(graph)   # Run detection
 reports = detector.detect_all()  # List of RaceReport
 ```
+
+**Race types:** `DATA_RACE`, `MISSING_WAIT`, `BUFFER_ALIASING`, `DEPENDENCY_VIOLATION`, `ORPHANED_HANDLE`
 
 ---
 

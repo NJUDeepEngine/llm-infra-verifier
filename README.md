@@ -3,7 +3,7 @@
 > **Static verification framework for distributed LLM training.**
 > Catches placement bugs and communication races at compile time — no GPUs needed.
 
-[![Tests](https://img.shields.io/badge/tests-531%20passed-green)]()
+[![Tests](https://img.shields.io/badge/tests-660%20passed-green)]()
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)]()
 [![License](https://img.shields.io/badge/license-Apache%202.0-orange)]()
 
@@ -42,7 +42,7 @@ Input Source (PyTorch / Megatron / TileLang TIR)
 │  "Where"     │        │  "When"      │
 │              │        │              │
 │ Z3 SMT       │        │ HB graph     │
-│ 6 checks     │        │ 4 checks     │
+│ 6 checks     │        │ 5 checks     │
 └──────────────┘        └──────────────┘
 ```
 
@@ -57,6 +57,8 @@ Input Source (PyTorch / Megatron / TileLang TIR)
 | Shape consistency | Shapes valid through collectives | Divisibility constraints |
 | PP deadlock freedom | No circular Send/Recv waits | DFS cycle detection |
 
+**Multi-dim mesh support:** N-dimensional meshes (e.g. TP×DP) with per-dim Z3 variables. Collectives with `mesh_dim` target only the specified dimension, preserving placements on other dims.
+
 ### Temporal Verification (Happens-Before + Z3)
 
 | Check | Property | Method |
@@ -65,6 +67,7 @@ Input Source (PyTorch / Megatron / TileLang TIR)
 | Missing Wait | Async output read before sync | Handle-waited analysis |
 | Buffer aliasing | Two async ops write same buffer | WAW detection |
 | Dependency violation | Recv before matching Send | HB ordering |
+| Orphaned handle | Async handle never waited on | Handle lifecycle tracking |
 
 ---
 
@@ -85,6 +88,8 @@ Input Source (PyTorch / Megatron / TileLang TIR)
 | Loss | CrossEntropyLoss | logits Shard(vocab)→Partial |
 
 ### Communication (8 NCCL collectives + 4 P2P)
+
+All collectives support optional `mesh_dim` for multi-dim meshes — targets only the specified dimension.
 
 | Op | Forward | Backward Dual |
 |----|---------|---------------|
@@ -135,8 +140,8 @@ verifier/
 │   ├── cp.py           #   Ring attention ops
 │   └── moe.py          #   MoE dispatch/combine
 ├── executor.py         # Multi-device symbolic executor
-├── solver.py           # Z3 spatial verifier (6 checks)
-├── temporal.py         # HB graph + race detection (4 checks)
+├── solver.py           # Z3 spatial verifier (6 checks, multi-dim mesh)
+├── temporal.py         # HB graph + race detection (5 checks)
 ├── autograd.py         # VJP engine + gradient duality
 ├── rewrite.py          # Pattern matching + cost model
 ├── synthesis.py        # Beam-search tactic synthesis
@@ -144,7 +149,7 @@ verifier/
 ├── llm_frontend.py     # PyTorch → IR via LLM + feedback loop
 └── tir_lifter.py       # TileLang TIR → IR lifter
 
-tests/                  # 531 tests across 11 files
+tests/                  # 660 tests across 13 files
 examples/               # 9 runnable demos
 benchmarks/             # 3 suites
 docs/                   # Architecture & API docs
@@ -156,7 +161,7 @@ docs/                   # Architecture & API docs
 
 ```bash
 pip install -r requirements.txt  # z3-solver, pytest
-python -m pytest tests/ -v       # run all 531 tests
+python -m pytest tests/ -v       # run all 660 tests
 ```
 
 ### Example: Verify Tensor-Parallel Linear
@@ -285,6 +290,7 @@ Key rules enforced by `SPMDGuard`:
 | Pipeline Parallelism | Send/Recv matching, deadlock | 1F1B schedule ordering |
 | Context Parallelism | Ring placement propagation | Async ring communication |
 | Data Parallelism | Gradient duality | Async gradient AllReduce |
+| TP + DP (multi-dim mesh) | Per-dim placement, mesh_dim targeting | Per-dim async races |
 | ZeRO-1/2/3 | Shard/gather consistency | ReduceScatter ordering |
 | MoE (Expert Parallel) | AllToAll dispatch/combine | Token routing races |
 | Mixed Precision (FP8) | Scale freshness, format usage | Delayed scaling ordering |

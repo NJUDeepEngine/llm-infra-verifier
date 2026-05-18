@@ -10,7 +10,7 @@ permalink: /
 Static verification framework for distributed LLM training — catches placement bugs and communication races at compile time.
 
 {: .fs-5 }
-Built on **Z3 SMT solver** + **symbolic execution** + **Happens-Before temporal analysis**. 48 IR ops, 10 verification checks, 531 tests. Zero GPU required.
+Built on **Z3 SMT solver** + **symbolic execution** + **Happens-Before temporal analysis**. 48 IR ops, 11 verification checks, 660 tests. Multi-dim mesh aware. Zero GPU required.
 
 [Get Started](getting-started){: .btn .btn-primary .fs-5 .mb-4 .mb-md-0 .mr-2 }
 [View on GitHub](https://github.com/NJUDeepEngine/llm-infra-verifier){: .btn .fs-5 .mb-4 .mb-md-0 }
@@ -34,11 +34,11 @@ Distributed training bugs are silent, intermittent, and catastrophic at scale:
 
 ## Two-Dimensional Verification
 
-| | Spatial (6 checks) | Temporal (4 checks) |
+| | Spatial (6 checks) | Temporal (5 checks) |
 |---|---|---|
 | **Question** | Where does each tensor go? | When do things happen? |
 | **Method** | Z3 SMT + symbolic execution | Happens-Before graph + Z3 |
-| **Bugs caught** | Missing collectives, wrong placement, gradient inconsistencies | Races, missing waits, buffer aliasing |
+| **Bugs caught** | Missing collectives, wrong placement, gradient inconsistencies | Races, missing waits, buffer aliasing, orphaned handles |
 
 ---
 
@@ -77,8 +77,8 @@ print(verifier.summary())
 | Metric | Value |
 |--------|-------|
 | IR Operations | 48 (compute, collective, P2P, async, shape, precision, ZeRO, CP, MoE) |
-| Verification Checks | 10 (6 spatial + 4 temporal) |
-| Tests | 531 (all passing) |
+| Verification Checks | 11 (6 spatial + 5 temporal) |
+| Tests | 660 (all passing) |
 | Examples | 9 runnable demos |
 | Dependencies | 2 (z3-solver, pytest) |
-| Parallelism Coverage | TP, PP, CP, DP, ZeRO, MoE, FP8 |
+| Parallelism Coverage | TP, PP, CP, DP, TP+DP (multi-dim mesh), ZeRO, MoE, FP8 |

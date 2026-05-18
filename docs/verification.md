@@ -60,7 +60,7 @@ Ensures:
 - Communication graph has no circular waits
 - DFS cycle detection on the wait-for graph
 
-## Temporal Verification (4 checks)
+## Temporal Verification (5 checks)
 
 ### 1. Data Race
 
@@ -97,6 +97,22 @@ h2 = dist.all_reduce(g2, out=buf, async_op=True)  # also writes buf! BUG!
 ### 4. Dependency Violation
 
 Ensures required ordering (e.g., `SendAsync` must complete before matching `RecvAsync` starts) is not violated by the HB graph.
+
+### 5. Orphaned Handle
+
+{: .warning }
+An async op (e.g., `AllReduceAsync`) produces a handle that is **never consumed by any `Wait` or `WaitAll`**, meaning the async result may never be synchronized.
+
+**Detection:** Collect all handles created by async ops, subtract handles referenced by Wait/WaitAll, flag remaining as orphans.
+
+**Common pattern:**
+```python
+# BUG
+handle = dist.all_reduce(grad, async_op=True)
+# ...other computation...
+# handle.wait() never called! Result may be incomplete
+next_layer(grad)
+```
 
 ## Happens-Before Model
 
