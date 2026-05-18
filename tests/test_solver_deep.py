@@ -806,3 +806,141 @@ class TestMultiDimMesh:
         shape_results = solver.check_shape_consistency()
         # All divisibility checks should pass: 16/2=8 (TP on x cols), 8/4=2 (DP on x rows)
         assert all(r.passed for r in shape_results)
+
+
+# ── Mesh-dim-aware collective encoding tests ──────────────────────────────────
+
+
+class TestMeshDimCollectives:
+    """Z3 solver respects op.mesh_dim for targeted collective encoding."""
+
+    def test_allreduce_mesh_dim_preserves_other_dims(self):
+        """AllReduce(mesh_dim=0) on (P, S0) → (R, S0): only resolves dim 0."""
+        program = Program("ar_md0", ops=[
+            AllReduce(x="x", output="y", mesh_dim=0),
+        ])
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        solver.add_input("x", (Partial(), Shard(dim=0)))
+        solver.encode_program(program)
+
+        sat_result = solver.check_program_satisfiability()
+        assert sat_result.passed
+
+        # y is (R, S0) — NOT fully Replicate
+        eq_results = solver.check_output_equivalence(["y"])
+        assert not all(r.passed for r in eq_results)
+
+    def test_allgather_mesh_dim_preserves_other_dims(self):
+        """AllGather(mesh_dim=0) on (S0, S0) → (R, S0): gathers only on dim 0."""
+        program = Program("ag_md0", ops=[
+            AllGather(x="x", output="y", gather_dim=0, mesh_dim=0),
+        ])
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        solver.add_input("x", (Shard(dim=0), Shard(dim=0)))
+        solver.encode_program(program)
+
+        sat_result = solver.check_program_satisfiability()
+        assert sat_result.passed
+
+        # y is (R, S0) — NOT fully Replicate
+        eq_results = solver.check_output_equivalence(["y"])
+        assert not all(r.passed for r in eq_results)
+
+    def test_reducescatter_mesh_dim_targets_specific_dim(self):
+        """ReduceScatter(mesh_dim=1) only transforms mesh dim 1."""
+        program = Program("rs_md1", ops=[
+            ReduceScatter(x="x", output="y", scatter_dim=0, mesh_dim=1),
+        ])
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        solver.add_input("x", (Replicate(), Partial()))
+        solver.encode_program(program)
+
+        sat_result = solver.check_program_satisfiability()
+        assert sat_result.passed
+
+        # y is (R, S0) — dim 0 preserved as R, dim 1 transformed to S0
+        eq_results = solver.check_output_equivalence(["y"])
+        assert not all(r.passed for r in eq_results)
+
+    def test_alltoall_mesh_dim(self):
+        """AllToAll(mesh_dim=0) swaps dims only on mesh dim 0, preserves dim 1."""
+        program = Program("a2a_md0", ops=[
+            AllToAll(x="x", output="y", split_dim=0, concat_dim=1, mesh_dim=0),
+        ])
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        solver.add_input("x", (Shard(dim=0), Shard(dim=0)))
+        solver.encode_program(program)
+
+        sat_result = solver.check_program_satisfiability()
+        assert sat_result.passed
+
+        # y is (S1, S0) — dim 0 transformed S0→S1, dim 1 preserved S0
+        eq_results = solver.check_output_equivalence(["y"])
+        assert not all(r.passed for r in eq_results)
+
+    def test_allreduce_no_mesh_dim_resolves_all(self):
+        """AllReduce without mesh_dim resolves Partial on ALL mesh dims (backward compat)."""
+        program = Program("ar_legacy", ops=[
+            AllReduce(x="x", output="y"),
+        ])
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        solver.add_input("x", (Partial(), Partial()))
+        solver.encode_program(program)
+
+        # y should be (R, R) — fully Replicate
+        eq_results = solver.check_output_equivalence(["y"])
+        assert all(r.passed for r in eq_results)
+
+    def test_tp_allreduce_preserves_dp_shard(self):
+        """Real-world TP+DP: MatMul → AllReduce(mesh_dim=0) preserves DP Shard(0).
+
+        x: (S1, S0) — col-sharded on TP, row-sharded on DP
+        w: (S0, R)  — row-sharded on TP, replicated on DP
+        y_p: (P, S0) — Partial on TP, S0 preserved on DP
+        y: (R, S0)   — AllReduce resolves only TP dim
+        """
+        program = Program("tp_dp_real", ops=[
+            MatMul(a="x", b="w", output="y_p"),
+            AllReduce(x="y_p", output="y", mesh_dim=0),
+        ])
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        solver.add_input("x", (Shard(dim=1), Shard(dim=0)))
+        solver.add_input("w", (Shard(dim=0), Replicate()))
+        solver.encode_program(program)
+
+        sat_result = solver.check_program_satisfiability()
+        assert sat_result.passed
+
+        # y is (R, S0) — NOT fully Replicate (DP shard preserved)
+        eq_results = solver.check_output_equivalence(["y"])
+        assert not all(r.passed for r in eq_results)
+
+    def test_scatter_mesh_dim_preserves_other_dims(self):
+        """Scatter(mesh_dim=0) only transforms dim 0, preserves dim 1."""
+        program = Program("sc_md0", ops=[
+            Scatter(x="x", output="y", scatter_dim=0, mesh_dim=0),
+        ])
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        solver.add_input("x", (Replicate(), Shard(dim=1)))
+        solver.encode_program(program)
+
+        sat_result = solver.check_program_satisfiability()
+        assert sat_result.passed
+
+        # y is (S0, S1) — dim 0 transformed R→S0, dim 1 preserved S1
+        eq_results = solver.check_output_equivalence(["y"])
+        assert not all(r.passed for r in eq_results)
+
+    def test_precondition_check_respects_mesh_dim(self):
+        """Precondition for AllReduce(mesh_dim=0) checks Partial on dim 0 only."""
+        program = Program("prec_md", ops=[
+            AllReduce(x="x", output="y", mesh_dim=0),
+        ])
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        # x is Partial on dim 0 (correct for AllReduce), Shard(0) on dim 1
+        solver.add_input("x", (Partial(), Shard(dim=0)))
+        solver.encode_program(program)
+
+        results = solver.check_collective_preconditions(program)
+        # Should pass: dim 0 is Partial as required
+        assert all(r.passed for r in results)

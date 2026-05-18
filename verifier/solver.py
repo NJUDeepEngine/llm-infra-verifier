@@ -249,22 +249,36 @@ class Z3PlacementSolver:
             if effective_dim in (0, 1):
                 self.solver.add(x_vs[m] != IntVal(forbidden_pl))
 
-    def _encode_to_replicate(self, op):
+    def _encode_collective_constrained(self, op, target_pl: int,
+                                        mesh_dim: Optional[int]):
+        """Encode collective with mesh_dim awareness.
+
+        When mesh_dim is set, only the targeted mesh dim gets target_pl;
+        other dims pass through from input. When mesh_dim is None (legacy),
+        all mesh dims get target_pl.
+        """
+        x_name = op.input_names[0]
+        x_vs = self._var(x_name)
         y_vs = self._var(op.output_name)
-        for m in range(self._mesh_ndim):
-            self.solver.add(y_vs[m] == IntVal(PL_R))
+        if mesh_dim is not None and mesh_dim < self._mesh_ndim:
+            for m in range(self._mesh_ndim):
+                if m == mesh_dim:
+                    self.solver.add(y_vs[m] == IntVal(target_pl))
+                else:
+                    self.solver.add(y_vs[m] == x_vs[m])
+        else:
+            for m in range(self._mesh_ndim):
+                self.solver.add(y_vs[m] == IntVal(target_pl))
 
     def _encode_reducescatter(self, op):
-        y_vs = self._var(op.output)
         sd = op.scatter_dim
-        for m in range(self._mesh_ndim):
-            self.solver.add(y_vs[m] == IntVal(PL_S0 if sd == 0 else PL_S1))
+        target_pl = PL_S0 if sd == 0 else PL_S1
+        self._encode_collective_constrained(op, target_pl, op.mesh_dim)
 
     def _encode_alltoall(self, op):
-        y_vs = self._var(op.output)
         cd = op.concat_dim
-        for m in range(self._mesh_ndim):
-            self.solver.add(y_vs[m] == IntVal(PL_S0 if cd == 0 else PL_S1))
+        target_pl = PL_S0 if cd == 0 else PL_S1
+        self._encode_collective_constrained(op, target_pl, op.mesh_dim)
 
     def _encode_flash_attention(self, op):
         q_vs, y_vs = self._var(op.q), self._var(op.output)
@@ -302,20 +316,20 @@ class Z3PlacementSolver:
                 self._encode_reducescatter(op)
             elif isinstance(op, AllToAll):
                 self._encode_alltoall(op)
-            elif isinstance(op, (AllReduce, AllGather, Broadcast, Reduce, Gather)):
-                self._encode_to_replicate(op)
+            elif isinstance(op, (AllReduce, AllGather, Gather)):
+                self._encode_collective_constrained(op, PL_R, op.mesh_dim)
+            elif isinstance(op, (Broadcast, Reduce)):
+                self._encode_collective_constrained(op, PL_R, None)
             elif isinstance(op, Scatter):
-                y_vs = self._var(op.output)
                 sd = op.scatter_dim
-                for m in range(self._mesh_ndim):
-                    self.solver.add(y_vs[m] == IntVal(PL_S0 if sd == 0 else PL_S1))
+                target_pl = PL_S0 if sd == 0 else PL_S1
+                self._encode_collective_constrained(op, target_pl, op.mesh_dim)
             elif isinstance(op, (ZeROGatherParam,)):
-                self._encode_to_replicate(op)
+                self._encode_collective_constrained(op, PL_R, None)
             elif isinstance(op, ZeROScatterGrad):
-                y_vs = self._var(op.output)
                 sd = op.scatter_dim
-                for m in range(self._mesh_ndim):
-                    self.solver.add(y_vs[m] == IntVal(PL_S0 if sd == 0 else PL_S1))
+                target_pl = PL_S0 if sd == 0 else PL_S1
+                self._encode_collective_constrained(op, target_pl, None)
             elif isinstance(op, LayerNorm):
                 self._encode_norm_op(op, op.norm_dim)
             elif isinstance(op, RMSNorm):
@@ -335,8 +349,8 @@ class Z3PlacementSolver:
             elif isinstance(op, (OverlapRegion,)):
                 for sub in op.compute_ops + op.comm_ops:
                     self._encode_op_single(sub)
-            elif isinstance(op, (AllReduceAsync,)):
-                self._encode_passthrough(op)
+            elif isinstance(op, AllReduceAsync):
+                self._encode_collective_constrained(op, PL_R, op.mesh_dim)
             elif isinstance(op, TopKGate):
                 self._encode_passthrough(op)
             elif isinstance(op, (MoEDispatch, MoECombine)):
@@ -348,8 +362,10 @@ class Z3PlacementSolver:
             self._encode_matmul(op)
         elif isinstance(op, ElementWiseBinaryOp):
             self._encode_elementwise(op)
-        elif isinstance(op, (AllReduce, AllGather, Broadcast, Reduce, Gather)):
-            self._encode_to_replicate(op)
+        elif isinstance(op, (AllReduce, AllGather, Gather)):
+            self._encode_collective_constrained(op, PL_R, op.mesh_dim)
+        elif isinstance(op, (Broadcast, Reduce)):
+            self._encode_collective_constrained(op, PL_R, None)
         elif isinstance(op, ReduceScatter):
             self._encode_reducescatter(op)
         elif isinstance(op, AllToAll):
@@ -524,32 +540,38 @@ class Z3PlacementSolver:
         results = []
 
         for op in program.ops:
+            md = getattr(op, 'mesh_dim', None) or 0
             if isinstance(op, (AllReduce, Reduce)):
                 results.append(self._check_precondition(
                     type(op).__name__, op.x, PL_P, "Partial",
+                    mesh_dim=md,
                 ))
             elif isinstance(op, AllGather):
                 expected_pl = PL_S0 if op.gather_dim == 0 else PL_S1
                 expected_label = f"Shard({op.gather_dim})"
                 results.append(self._check_precondition(
                     "AllGather", op.x, expected_pl, expected_label,
+                    mesh_dim=md,
                 ))
             elif isinstance(op, ReduceScatter):
                 results.append(self._check_precondition_or(
                     "ReduceScatter", op.x,
                     [PL_R, PL_P], "Replicate or Partial",
+                    mesh_dim=md,
                 ))
             elif isinstance(op, AllToAll):
                 expected_pl = PL_S0 if op.split_dim == 0 else PL_S1
                 expected_label = f"Shard({op.split_dim})"
                 results.append(self._check_precondition(
                     "AllToAll", op.x, expected_pl, expected_label,
+                    mesh_dim=md,
                 ))
             elif isinstance(op, Gather):
                 expected_pl = PL_S0 if op.gather_dim == 0 else PL_S1
                 expected_label = f"Shard({op.gather_dim})"
                 results.append(self._check_precondition(
                     "Gather", op.x, expected_pl, expected_label,
+                    mesh_dim=md,
                 ))
 
         return results
@@ -773,7 +795,9 @@ class Z3PlacementSolver:
     def _encode_shape_collective_preserve(self, op, mesh_sizes):
         """Shape constraint for collectives that preserve global shape (AllReduce, Broadcast).
 
-        After AllReduce/Broadcast, output is Replicate → local == global.
+        When mesh_dim is set, output may not be fully Replicate (other dims
+        preserve input placement), so local shape depends on output placement.
+        When mesh_dim is None, output is fully Replicate → local == global.
         """
         if op.x not in self._shape_vars:
             return
@@ -781,7 +805,14 @@ class Z3PlacementSolver:
         gs_y, ls_y = self._shape_var(op.output)
         for d in range(len(gs_x)):
             self.solver.add(gs_y[d] == gs_x[d])
-            self.solver.add(ls_y[d] == gs_y[d])
+
+        md = getattr(op, 'mesh_dim', None)
+        if md is not None:
+            pl_y = self._var(op.output_name)
+            self._add_local_shape_constraints(gs_y, ls_y, pl_y, mesh_sizes)
+        else:
+            for d in range(len(gs_x)):
+                self.solver.add(ls_y[d] == gs_y[d])
 
     def encode_shape_constraints(self, program: Program, tp_size: int = 0,
                                   mesh_sizes: Optional[List[int]] = None):
@@ -856,12 +887,11 @@ class Z3PlacementSolver:
                     continue
                 gs_x = self._shape_vars[op.x]
                 gs_y, ls_y = self._shape_var(op.output)
-                # AllGather on gather_dim multiplies by the mesh size on first dim
-                # (the collective operates on the mesh dim where input is sharded)
-                tp = IntVal(mesh_sizes[0])
+                md = op.mesh_dim if op.mesh_dim is not None else 0
+                gather_size = IntVal(mesh_sizes[min(md, len(mesh_sizes) - 1)])
                 for d in range(len(gs_x)):
                     if d == op.gather_dim:
-                        self.solver.add(gs_y[d] == gs_x[d] * tp)
+                        self.solver.add(gs_y[d] == gs_x[d] * gather_size)
                     else:
                         self.solver.add(gs_y[d] == gs_x[d])
                     self.solver.add(ls_y[d] == gs_y[d])
@@ -901,7 +931,8 @@ class Z3PlacementSolver:
                     continue
                 gs_x = self._shape_vars[op.x]
                 gs_y, ls_y = self._shape_var(op.output)
-                tp = IntVal(mesh_sizes[0])
+                md = op.mesh_dim if op.mesh_dim is not None else 0
+                tp = IntVal(mesh_sizes[min(md, len(mesh_sizes) - 1)])
                 for d in range(len(gs_x)):
                     if d == op.gather_dim:
                         self.solver.add(gs_y[d] == gs_x[d] * tp)
