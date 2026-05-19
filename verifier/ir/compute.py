@@ -170,6 +170,15 @@ class MatMul(IROp):
         a = ctx[self.a]
         b = ctx[self.b]
 
+        if a.global_shape[1] != b.global_shape[0]:
+            raise ValueError(
+                f"MatMul: contraction dimension mismatch: "
+                f"'{self.a}' has shape {a.global_shape} (cols={a.global_shape[1]}) "
+                f"but '{self.b}' has shape {b.global_shape} (rows={b.global_shape[0]}). "
+                f"MatMul requires A.shape[1] == B.shape[0]. "
+                f"Op: MatMul({self.a}, {self.b}) -> {self.output}"
+            )
+
         out_global = (a.global_shape[0], b.global_shape[1])
 
         a_spec = a.sharding

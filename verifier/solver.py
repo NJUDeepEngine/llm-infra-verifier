@@ -900,14 +900,10 @@ class Z3PlacementSolver:
                     continue
                 gs_x = self._shape_vars[op.x]
                 gs_y, ls_y = self._shape_var(op.output)
-                md = op.mesh_dim if op.mesh_dim is not None else 0
-                gather_size = IntVal(mesh_sizes[min(md, len(mesh_sizes) - 1)])
+                pl_y = self._var(op.output)
                 for d in range(len(gs_x)):
-                    if d == op.gather_dim:
-                        self.solver.add(gs_y[d] == gs_x[d] * gather_size)
-                    else:
-                        self.solver.add(gs_y[d] == gs_x[d])
-                    self.solver.add(ls_y[d] == gs_y[d])
+                    self.solver.add(gs_y[d] == gs_x[d])
+                self._add_local_shape_constraints(gs_y, ls_y, pl_y, mesh_sizes)
 
             elif isinstance(op, ReduceScatter):
                 if op.x not in self._shape_vars:
@@ -944,14 +940,10 @@ class Z3PlacementSolver:
                     continue
                 gs_x = self._shape_vars[op.x]
                 gs_y, ls_y = self._shape_var(op.output)
-                md = op.mesh_dim if op.mesh_dim is not None else 0
-                tp = IntVal(mesh_sizes[min(md, len(mesh_sizes) - 1)])
+                pl_y = self._var(op.output)
                 for d in range(len(gs_x)):
-                    if d == op.gather_dim:
-                        self.solver.add(gs_y[d] == gs_x[d] * tp)
-                    else:
-                        self.solver.add(gs_y[d] == gs_x[d])
-                    self.solver.add(ls_y[d] == gs_y[d])
+                    self.solver.add(gs_y[d] == gs_x[d])
+                self._add_local_shape_constraints(gs_y, ls_y, pl_y, mesh_sizes)
 
             elif isinstance(op, (SiLU, GELU, ReLU, Dropout,
                                  LayerNorm, RMSNorm, Softmax,
@@ -1264,21 +1256,33 @@ class DistributedVerifier:
           - AllGather: input must be sharded on gather_dim
           - ReduceScatter: input must be replicated on scatter_dim
           - Send/Recv: must have matching pairs
+
+        Uses pre-op tensor state (not final state) so that in-place ops
+        like AllReduce(x="p", output="p") are checked correctly.
         """
         errors = []
 
-        # Build a merged view across all devices
-        merged_states = dict(tensor_states) if tensor_states else {}
+        # Build a merged view across all devices (final state)
+        final_states = dict(tensor_states) if tensor_states else {}
         if multi_device_states:
             for did, dev_states in multi_device_states.items():
                 for name, ts in dev_states.items():
-                    if name not in merged_states:
-                        merged_states[name] = ts
+                    if name not in final_states:
+                        final_states[name] = ts
+
+        # Walk ops in program order, tracking live tensor state so that
+        # preconditions are checked against pre-op state (not final state).
+        # This is critical for in-place ops like AllReduce(x="p", output="p").
+        all_outputs = {op.output_name for op in program.ops if op.output_name}
+        live = {
+            name: ts for name, ts in final_states.items()
+            if name not in all_outputs
+        }
 
         for op in program.ops:
             if isinstance(op, (AllReduce, Reduce)):
-                if op.x in merged_states:
-                    ts = merged_states[op.x]
+                if op.x in live:
+                    ts = live[op.x]
                     if not ts.partial:
                         errors.append(
                             f"{type(op).__name__}({op.x}) called on non-partial "
@@ -1292,8 +1296,8 @@ class DistributedVerifier:
                     )
 
             elif isinstance(op, AllGather):
-                if op.x in merged_states:
-                    ts = merged_states[op.x]
+                if op.x in live:
+                    ts = live[op.x]
                     has_shard_on_dim = any(
                         isinstance(p, Shard) and p.dim == op.gather_dim
                         for p in ts.sharding.placements
@@ -1305,8 +1309,8 @@ class DistributedVerifier:
                         )
 
             elif isinstance(op, ReduceScatter):
-                if op.x in merged_states:
-                    ts = merged_states[op.x]
+                if op.x in live:
+                    ts = live[op.x]
                     has_shard_on_scatter = any(
                         isinstance(p, Shard) and p.dim == op.scatter_dim
                         for p in ts.sharding.placements
@@ -1318,8 +1322,8 @@ class DistributedVerifier:
                         )
 
             elif isinstance(op, AllToAll):
-                if op.x in merged_states:
-                    ts = merged_states[op.x]
+                if op.x in live:
+                    ts = live[op.x]
                     has_shard_on_split = any(
                         isinstance(p, Shard) and p.dim == op.split_dim
                         for p in ts.sharding.placements
@@ -1331,8 +1335,8 @@ class DistributedVerifier:
                         )
 
             elif isinstance(op, Gather):
-                if op.x in merged_states:
-                    ts = merged_states[op.x]
+                if op.x in live:
+                    ts = live[op.x]
                     has_shard_on_dim = any(
                         isinstance(p, Shard) and p.dim == op.gather_dim
                         for p in ts.sharding.placements
@@ -1370,6 +1374,21 @@ class DistributedVerifier:
                         f"Recv(src={op.src}, dst={op.dst}, mb={op.microbatch_id}) "
                         f"has no matching Send"
                     )
+
+            # Update live state: try to compute output from op semantics,
+            # fall back to final_states for ops we can't replay.
+            out_name = op.output_name
+            if out_name:
+                ctx = {n: live[n] for n in op.input_names if n in live}
+                if len(ctx) == len(op.input_names):
+                    try:
+                        result = op.apply(ctx)
+                        live[out_name] = result
+                    except Exception:
+                        if out_name in final_states:
+                            live[out_name] = final_states[out_name]
+                elif out_name in final_states:
+                    live[out_name] = final_states[out_name]
 
         passed = len(errors) == 0
         details = "; ".join(errors) if errors else "All communication ops are legal"

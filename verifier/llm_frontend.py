@@ -386,17 +386,29 @@ class MockLLM:
         self.call_count = 0
         self.call_history: List[Tuple[str, str]] = []  # [(prompt, response)]
 
+    def _extract_user_code(self, prompt: str) -> str:
+        """Extract the user code section from the prompt, ignoring few-shot examples."""
+        marker = "PyTorch Code:"
+        idx = prompt.rfind(marker)
+        if idx >= 0:
+            return prompt[idx:]
+        marker_lower = "pytorch code:"
+        idx = prompt.lower().rfind(marker_lower)
+        if idx >= 0:
+            return prompt[idx:]
+        return prompt
+
     def generate(self, prompt: str) -> str:
         """Generate a response based on known patterns in the prompt."""
         self.call_count += 1
-        prompt_lower = prompt.lower()
+        user_code = self._extract_user_code(prompt)
+        code_lower = user_code.lower()
 
-        # Check most specific patterns first, then fall back to generic
-        has_allreduce = "all_reduce" in prompt_lower
-        has_matmul = "matmul" in prompt_lower or " @ " in prompt
-        has_send_recv = "send" in prompt_lower and "recv" in prompt_lower
+        has_allreduce = "all_reduce" in code_lower
+        has_matmul = "matmul" in code_lower or " @ " in user_code
+        has_send_recv = "send" in code_lower and "recv" in code_lower
 
-        if "silu" in prompt_lower and "gate" in prompt_lower:
+        if "silu" in code_lower and "gate" in code_lower:
             # TP MLP pattern
             response = json.dumps({
                 "fwd_ops": [
