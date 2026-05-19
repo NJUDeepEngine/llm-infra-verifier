@@ -625,6 +625,96 @@ class TestSynthesis:
         )
         assert has_ar, "Synthesized program should contain AllReduce"
 
+    def test_tactic_rewrites_downstream_consumers(self):
+        """After inserting AllReduce, downstream ops must use the reduced output."""
+        from verifier.synthesis import Tactic, TacticType
+
+        prog = Program(name="multi_op")
+        prog.add(MatMul(a="x", b="w", output="y_partial"))
+        prog.add(Add(a="y_partial", b="bias", output="z"))
+
+        tactic = Tactic(
+            type=TacticType.INSERT_ALLREDUCE,
+            op_index=0,
+            tensor_name="y_partial",
+            output_name="y",
+        )
+        fixed = tactic.apply(prog)
+
+        assert len(fixed.ops) == 3
+        assert isinstance(fixed.ops[1], AllReduce)
+        assert fixed.ops[1].x == "y_partial"
+        assert fixed.ops[1].output == "y"
+        # Downstream Add must consume "y", not "y_partial"
+        add_op = fixed.ops[2]
+        assert "y" in add_op.input_names
+        assert "y_partial" not in add_op.input_names
+
+    def test_tactic_allgather_rewrites_downstream(self):
+        """AllGather tactic also remaps downstream consumers."""
+        from verifier.synthesis import Tactic, TacticType
+
+        prog = Program(name="ag_test")
+        prog.add(MatMul(a="x", b="w", output="y_sharded"))
+        prog.add(MatMul(a="y_sharded", b="w2", output="z"))
+
+        tactic = Tactic(
+            type=TacticType.INSERT_ALLGATHER,
+            op_index=0,
+            tensor_name="y_sharded",
+            output_name="y_full",
+            params={"gather_dim": 0},
+        )
+        fixed = tactic.apply(prog)
+
+        assert len(fixed.ops) == 3
+        assert isinstance(fixed.ops[1], AllGather)
+        downstream_mm = fixed.ops[2]
+        assert downstream_mm.a == "y_full"
+
+    def test_synthesis_multi_op_dataflow(self):
+        """Synthesis on a multi-op graph produces correct dataflow."""
+        mesh = DeviceMesh(shape=(2,), dim_names=("tp",))
+        spec_s1 = ShardingSpec(placements=(Shard(dim=1),), mesh=mesh)
+        spec_s0 = ShardingSpec(placements=(Shard(dim=0),), mesh=mesh)
+        spec_r = ShardingSpec(placements=(Replicate(),), mesh=mesh)
+
+        x = TensorState(
+            name="x", global_shape=(8, 16),
+            local_shape=compute_local_shape((8, 16), spec_s1),
+            sharding=spec_s1, expr="x", requires_grad=True,
+        )
+        w = TensorState(
+            name="w", global_shape=(16, 32),
+            local_shape=compute_local_shape((16, 32), spec_s0),
+            sharding=spec_s0, expr="w", requires_grad=True,
+        )
+        bias = TensorState(
+            name="bias", global_shape=(8, 32),
+            local_shape=(8, 32),
+            sharding=spec_r, expr="bias",
+        )
+
+        prog = Program(name="compute")
+        prog.add(MatMul(a="x", b="w", output="y"))
+        prog.add(Add(a="y", b="bias", output="z"))
+
+        from verifier.synthesis import SynthesisEngine
+        engine = SynthesisEngine(max_tactics=3, max_search_depth=2)
+        result = engine.synthesize(prog, {"x": x, "w": w, "bias": bias}, mesh)
+
+        assert result.success
+        best = result.best_candidate.program
+        # The Add must consume the AllReduced output, not the Partial tensor
+        ar_output = None
+        for op in best.ops:
+            if isinstance(op, AllReduce):
+                ar_output = op.output
+        assert ar_output is not None, "Should have AllReduce"
+        add_op = [op for op in best.ops if isinstance(op, Add)][0]
+        assert ar_output in add_op.input_names, \
+            f"Add should consume '{ar_output}' but has inputs {add_op.input_names}"
+
 
 # ── LLM frontend tests ───────────────────────────────────────────────────────
 

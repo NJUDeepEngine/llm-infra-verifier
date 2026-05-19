@@ -157,6 +157,7 @@ class MultiDeviceExecutor:
     """
     mesh: DeviceMesh
     spmd_checking: bool = False
+    strict: bool = False
 
     def _apply_op(self, op: IROp, ctx: Dict[str, TensorState]) -> TensorState:
         if self.spmd_checking:
@@ -271,11 +272,14 @@ class MultiDeviceExecutor:
             for name in input_names:
                 t = dev.get(name)
                 if t is None:
-                    warnings.warn(
+                    msg = (
                         f"{type(op).__name__}: input '{name}' not found on "
-                        f"device {did}. Skipping op. "
+                        f"device {did}. "
                         f"Available: {list(dev.tensors.keys())}"
                     )
+                    if self.strict:
+                        raise ValueError(msg)
+                    warnings.warn(msg + " Skipping op.")
                     missing = True
                     break
                 local_ctx[name] = t
@@ -394,9 +398,18 @@ class MultiDeviceExecutor:
         src_dev = self.devices.get(op.src)
         dst_dev = self.devices.get(op.dst)
         if src_dev is None or dst_dev is None:
+            if self.strict:
+                raise ValueError(
+                    f"SendAsync: device src={op.src} or dst={op.dst} not found"
+                )
             return
         x = src_dev.get(op.x)
         if x is None:
+            if self.strict:
+                raise ValueError(
+                    f"SendAsync: input '{op.x}' not found on device {op.src}. "
+                    f"Available: {list(src_dev.tensors.keys())}"
+                )
             return
         local_ctx = {op.x: x}
         result = self._apply_op(op, local_ctx)
@@ -406,8 +419,18 @@ class MultiDeviceExecutor:
         """Execute async Recv: apply on dst device."""
         dst_dev = self.devices.get(op.dst)
         if dst_dev is None:
+            if self.strict:
+                raise ValueError(
+                    f"RecvAsync: device dst={op.dst} not found"
+                )
             return
         x = dst_dev.get(op.x)
+        if x is None:
+            if self.strict:
+                raise ValueError(
+                    f"RecvAsync: input '{op.x}' not found on device {op.dst}. "
+                    f"Available: {list(dst_dev.tensors.keys())}"
+                )
         local_ctx = {op.x: x} if x else {}
         result = self._apply_op(op, local_ctx)
         dst_dev.set(result)

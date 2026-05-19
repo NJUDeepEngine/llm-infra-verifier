@@ -1042,3 +1042,167 @@ class TestWaitEncoding:
         solver.encode_program(prog)
         eq = solver.check_output_equivalence(["z"])
         assert all(r.passed for r in eq)
+
+
+# ── In-place op SSA renaming ───────────────────────────────────────────────
+
+
+class TestInPlaceSSA:
+    """Z3 placement consistency must handle in-place ops via SSA renaming."""
+
+    def test_inplace_allreduce_passes_consistency(self):
+        """AllReduce(x='p', output='p') should pass Z3 placement consistency."""
+        mesh = DeviceMesh(shape=(2,), dim_names=("tp",))
+        spec_s1 = ShardingSpec(placements=(Shard(dim=1),), mesh=mesh)
+        spec_s0 = ShardingSpec(placements=(Shard(dim=0),), mesh=mesh)
+
+        x = TensorState(
+            name="x", global_shape=(8, 16),
+            local_shape=compute_local_shape((8, 16), spec_s1),
+            sharding=spec_s1, expr="x",
+        )
+        w = TensorState(
+            name="w", global_shape=(16, 32),
+            local_shape=compute_local_shape((16, 32), spec_s0),
+            sharding=spec_s0, expr="w",
+        )
+
+        prog = Program("inplace_ar", ops=[
+            MatMul(a="x", b="w", output="p"),
+            AllReduce(x="p", output="p"),
+        ])
+
+        import warnings
+        executor = MultiDeviceExecutor(mesh)
+        executor.register_tensor(x)
+        executor.register_tensor(w)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            state = executor.run_program(prog)
+
+        verifier = DistributedVerifier()
+        results = verifier.verify_all(prog, state, output_names=["p"])
+        for r in results:
+            assert r.passed, f"Failed: {r.condition} — {r.details}"
+
+    def test_inplace_chain_matmul_allreduce_matmul(self):
+        """In-place AllReduce between two MatMuls: p=matmul, p=AR(p), z=matmul(p,w2)."""
+        mesh = DeviceMesh(shape=(2,), dim_names=("tp",))
+        spec_s1 = ShardingSpec(placements=(Shard(dim=1),), mesh=mesh)
+        spec_s0 = ShardingSpec(placements=(Shard(dim=0),), mesh=mesh)
+        spec_r = ShardingSpec(placements=(Replicate(),), mesh=mesh)
+
+        x = TensorState(
+            name="x", global_shape=(8, 16),
+            local_shape=compute_local_shape((8, 16), spec_s1),
+            sharding=spec_s1, expr="x",
+        )
+        w = TensorState(
+            name="w", global_shape=(16, 32),
+            local_shape=compute_local_shape((16, 32), spec_s0),
+            sharding=spec_s0, expr="w",
+        )
+        w2 = TensorState(
+            name="w2", global_shape=(32, 16),
+            local_shape=(32, 16),
+            sharding=spec_r, expr="w2",
+        )
+
+        prog = Program("inplace_chain", ops=[
+            MatMul(a="x", b="w", output="p"),
+            AllReduce(x="p", output="p"),
+            MatMul(a="p", b="w2", output="z"),
+        ])
+
+        import warnings
+        executor = MultiDeviceExecutor(mesh)
+        executor.register_tensor(x)
+        executor.register_tensor(w)
+        executor.register_tensor(w2)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            state = executor.run_program(prog)
+
+        verifier = DistributedVerifier()
+        results = verifier.verify_all(prog, state, output_names=["z"])
+        for r in results:
+            assert r.passed, f"Failed: {r.condition} — {r.details}"
+
+    def test_ssa_rename_noop_for_distinct_names(self):
+        """Programs without in-place ops should not be modified by SSA."""
+        prog = Program("normal", ops=[
+            MatMul(a="x", b="w", output="y_partial"),
+            AllReduce(x="y_partial", output="y"),
+        ])
+
+        ssa_prog, ssa_map = DistributedVerifier._ssa_rename_program(prog)
+        # No in-place ops → same program returned
+        assert ssa_prog is prog
+        assert ssa_map == {}
+
+    def test_ssa_rename_creates_versions(self):
+        """In-place AllReduce creates versioned names."""
+        prog = Program("inplace", ops=[
+            MatMul(a="x", b="w", output="p"),
+            AllReduce(x="p", output="p"),
+        ])
+
+        ssa_prog, ssa_map = DistributedVerifier._ssa_rename_program(prog)
+        assert ssa_prog is not prog
+        # MatMul output is "p" (first definition, no version)
+        assert ssa_prog.ops[0].output == "p"
+        # AllReduce input is "p", output is "p__v1"
+        assert ssa_prog.ops[1].x == "p"
+        assert ssa_prog.ops[1].output == "p__v1"
+        assert ssa_map["p"] == "p__v1"
+
+    def test_inplace_with_downstream_consumer(self):
+        """In-place AllReduce + downstream op reads the latest version."""
+        prog = Program("inplace_chain", ops=[
+            MatMul(a="x", b="w", output="p"),
+            AllReduce(x="p", output="p"),
+            MatMul(a="p", b="w2", output="z"),
+        ])
+
+        ssa_prog, ssa_map = DistributedVerifier._ssa_rename_program(prog)
+        # After SSA: MatMul(x,w)->p, AllReduce(p)->p__v1, MatMul(p__v1,w2)->z
+        assert ssa_prog.ops[2].a == "p__v1"
+
+    def test_inplace_allreduce_2d_mesh(self):
+        """In-place AllReduce on 2D mesh passes Z3 consistency."""
+        mesh = DeviceMesh(shape=(2, 2), dim_names=("tp", "dp"))
+        spec_x = ShardingSpec(
+            placements=(Shard(dim=1), Replicate()), mesh=mesh,
+        )
+        spec_w = ShardingSpec(
+            placements=(Shard(dim=0), Replicate()), mesh=mesh,
+        )
+
+        x = TensorState(
+            name="x", global_shape=(8, 16),
+            local_shape=compute_local_shape((8, 16), spec_x),
+            sharding=spec_x, expr="x",
+        )
+        w = TensorState(
+            name="w", global_shape=(16, 32),
+            local_shape=compute_local_shape((16, 32), spec_w),
+            sharding=spec_w, expr="w",
+        )
+
+        prog = Program("inplace_2d", ops=[
+            MatMul(a="x", b="w", output="p"),
+            AllReduce(x="p", output="p"),
+        ])
+
+        import warnings
+        executor = MultiDeviceExecutor(mesh)
+        executor.register_tensor(x)
+        executor.register_tensor(w)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            state = executor.run_program(prog)
+
+        verifier = DistributedVerifier()
+        results = verifier.verify_all(prog, state, output_names=["p"])
+        for r in results:
+            assert r.passed, f"Failed: {r.condition} — {r.details}"

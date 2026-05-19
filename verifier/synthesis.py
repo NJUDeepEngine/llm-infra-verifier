@@ -85,38 +85,50 @@ class Tactic:
     params: Dict = field(default_factory=dict)  # extra params (gather_dim, etc.)
 
     def apply(self, program: Program) -> Program:
-        """Apply this tactic to create a new program."""
+        """Apply this tactic to create a new program.
+
+        After inserting a collective, remaps all downstream ops so they
+        consume the collective's output instead of the original tensor.
+        """
         new_prog = Program(name=f"{program.name}_{self.type.value}")
 
-        for i, op in enumerate(program.ops):
-            new_prog.ops.append(op)
+        collective_op = None
+        if self.type == TacticType.INSERT_ALLREDUCE:
+            collective_op = AllReduce(
+                x=self.tensor_name,
+                output=self.output_name,
+                op_type=self.params.get("op_type", "sum"),
+            )
+        elif self.type == TacticType.INSERT_ALLGATHER:
+            collective_op = AllGather(
+                x=self.tensor_name,
+                output=self.output_name,
+                gather_dim=self.params.get("gather_dim", 0),
+            )
+        elif self.type == TacticType.INSERT_REDUCESCATTER:
+            collective_op = ReduceScatter(
+                x=self.tensor_name,
+                output=self.output_name,
+                scatter_dim=self.params.get("scatter_dim", 0),
+            )
 
-            # Insert collective after the target op
-            if i == self.op_index:
-                if self.type == TacticType.INSERT_ALLREDUCE:
-                    new_prog.ops.append(
-                        AllReduce(
-                            x=self.tensor_name,
-                            output=self.output_name,
-                            op_type=self.params.get("op_type", "sum"),
-                        )
-                    )
-                elif self.type == TacticType.INSERT_ALLGATHER:
-                    new_prog.ops.append(
-                        AllGather(
-                            x=self.tensor_name,
-                            output=self.output_name,
-                            gather_dim=self.params.get("gather_dim", 0),
-                        )
-                    )
-                elif self.type == TacticType.INSERT_REDUCESCATTER:
-                    new_prog.ops.append(
-                        ReduceScatter(
-                            x=self.tensor_name,
-                            output=self.output_name,
-                            scatter_dim=self.params.get("scatter_dim", 0),
-                        )
-                    )
+        # Copy ops up to and including the target op
+        for i in range(self.op_index + 1):
+            if i < len(program.ops):
+                new_prog.ops.append(program.ops[i])
+
+        # Insert the collective
+        if collective_op is not None:
+            new_prog.ops.append(collective_op)
+
+        # Remap subsequent ops: replace references to tensor_name with output_name
+        input_map = {self.tensor_name: self.output_name}
+        for i in range(self.op_index + 1, len(program.ops)):
+            remapped = program.ops[i].clone_with_names(
+                input_map=input_map,
+                output_name=program.ops[i].output_name,
+            )
+            new_prog.ops.append(remapped)
 
         return new_prog
 

@@ -566,7 +566,7 @@ class LLMVerificationLoop:
 
             # Execute and verify
             try:
-                executor = MultiDeviceExecutor(mesh)
+                executor = MultiDeviceExecutor(mesh, strict=True)
                 if tensor_states:
                     for name, ts in tensor_states.items():
                         executor.register_tensor(ts)

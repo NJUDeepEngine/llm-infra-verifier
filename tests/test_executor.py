@@ -811,3 +811,53 @@ class TestLLMScenarios:
         assert h1 is not None and h1.microbatch_id == 1
         assert h0.global_shape == (4, 16)
 
+
+# ── Strict mode tests ──────────────────────────────────────────────────────────
+
+
+class TestStrictMode:
+    """Strict mode raises on missing inputs instead of warn-and-skip."""
+
+    def _make_executor(self, strict: bool):
+        mesh = DeviceMesh(shape=(2,), dim_names=("tp",))
+        exe = MultiDeviceExecutor(mesh, strict=strict)
+        spec = ShardingSpec(placements=(Replicate(),), mesh=mesh)
+        x = TensorState(
+            name="x", global_shape=(8, 16), local_shape=(8, 16),
+            sharding=spec, expr="x",
+        )
+        exe.register_tensor(x)
+        return exe
+
+    def test_strict_raises_on_missing_input(self):
+        """strict=True raises ValueError when an op's input is missing."""
+        exe = self._make_executor(strict=True)
+        prog = Program("bad", ops=[
+            MatMul(a="x", b="w_missing", output="y"),
+        ])
+        with pytest.raises(ValueError, match="w_missing"):
+            exe.run_program(prog)
+
+    def test_loose_warns_on_missing_input(self):
+        """strict=False (default) warns and skips, no exception."""
+        exe = self._make_executor(strict=False)
+        prog = Program("bad", ops=[
+            MatMul(a="x", b="w_missing", output="y"),
+        ])
+        import warnings
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            state = exe.run_program(prog)
+            assert any("w_missing" in str(warning.message) for warning in w)
+        assert "y" not in state
+
+    def test_strict_cascading_missing(self):
+        """strict=True catches the first missing input in a chain."""
+        exe = self._make_executor(strict=True)
+        prog = Program("chain", ops=[
+            MatMul(a="x", b="w_missing", output="y"),
+            Add(a="y", b="x", output="z"),
+        ])
+        with pytest.raises(ValueError, match="w_missing"):
+            exe.run_program(prog)
+

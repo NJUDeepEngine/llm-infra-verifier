@@ -1505,6 +1505,46 @@ class DistributedVerifier:
                     fwd_op.ring_dim == bwd_op.ring_dim)
         return True
 
+    @staticmethod
+    def _ssa_rename_program(program: Program):
+        """Apply SSA renaming to handle in-place ops (input name == output name).
+
+        Returns (ssa_program, final_name_map) where final_name_map maps
+        original tensor names to their latest SSA version.
+        """
+        version: Dict[str, int] = {}
+        live: Dict[str, str] = {}
+
+        def current(name: str) -> str:
+            return live.get(name, name)
+
+        def define(name: str) -> str:
+            if name in live:
+                ver = version.get(name, 0) + 1
+                version[name] = ver
+                ssa_name = f"{name}__v{ver}"
+                live[name] = ssa_name
+                return ssa_name
+            live[name] = name
+            return name
+
+        has_inplace = any(
+            op.output_name and op.output_name in op.input_names
+            for op in program.ops
+        )
+        if not has_inplace:
+            return program, {n: n for n in live}
+
+        ssa_prog = Program(name=program.name)
+        for op in program.ops:
+            input_map = {n: current(n) for n in op.input_names}
+            out_name = define(op.output_name) if op.output_name else op.output_name
+            ssa_prog.ops.append(
+                op.clone_with_names(input_map, out_name)
+            )
+
+        return ssa_prog, {orig: current(orig) for orig in live}
+
     def verify_placement_consistency(
         self,
         program: Program,
@@ -1517,7 +1557,11 @@ class DistributedVerifier:
         Encodes all op propagation rules as Z3 constraints and checks
         that output tensors are always Replicate (single-GPU equivalent).
         Automatically detects mesh dimensionality from tensor states.
+        Applies SSA renaming for in-place ops before encoding.
         """
+        # SSA rename to handle in-place ops like AllReduce(x="p", output="p")
+        ssa_program, ssa_map = self._ssa_rename_program(program)
+
         # Determine mesh_ndim from tensors
         mesh_ndim = 1
         if final_tensors:
@@ -1530,20 +1574,21 @@ class DistributedVerifier:
 
         if input_placements:
             for name, pl in input_placements.items():
-                z3s.add_input(name, pl)
+                z3s.add_input(ssa_map.get(name, name), pl)
         elif final_tensors:
-            all_inputs = {inp for op in program.ops for inp in op.input_names}
-            all_outputs = {op.output_name for op in program.ops}
+            all_inputs = {inp for op in ssa_program.ops for inp in op.input_names}
+            all_outputs = {op.output_name for op in ssa_program.ops}
             pure_inputs = all_inputs - all_outputs
-            for name in pure_inputs:
-                ts = final_tensors.get(name)
+            for ssa_name in pure_inputs:
+                orig = next((k for k, v in ssa_map.items() if v == ssa_name), ssa_name)
+                ts = final_tensors.get(orig) or final_tensors.get(ssa_name)
                 if ts and ts.sharding.placements:
                     if len(ts.sharding.placements) > 1:
-                        z3s.add_input(name, tuple(ts.sharding.placements))
+                        z3s.add_input(ssa_name, tuple(ts.sharding.placements))
                     else:
-                        z3s.add_input(name, ts.sharding.placements[0])
+                        z3s.add_input(ssa_name, ts.sharding.placements[0])
 
-        z3s.encode_program(program)
+        z3s.encode_program(ssa_program)
 
         # Check program satisfiability first
         sat_result = z3s.check_program_satisfiability()
@@ -1556,16 +1601,19 @@ class DistributedVerifier:
             self.results.append(vr)
             return vr
 
+        # Map output names through SSA
         if output_names is None:
-            all_inputs = {inp for op in program.ops for inp in op.input_names}
-            output_names = [
-                op.output_name for op in program.ops
+            all_inputs = {inp for op in ssa_program.ops for inp in op.input_names}
+            output_names_ssa = [
+                op.output_name for op in ssa_program.ops
                 if op.output_name not in all_inputs
             ]
+        else:
+            output_names_ssa = [ssa_map.get(n, n) for n in output_names]
 
-        eq_results = z3s.check_output_equivalence(output_names)
-        pc_results = z3s.check_collective_preconditions(program)
-        cc_results = z3s.check_compute_preconditions(program)
+        eq_results = z3s.check_output_equivalence(output_names_ssa)
+        pc_results = z3s.check_collective_preconditions(ssa_program)
+        cc_results = z3s.check_compute_preconditions(ssa_program)
 
         all_checks = eq_results + pc_results + cc_results
         all_passed = all(r.passed for r in all_checks)
