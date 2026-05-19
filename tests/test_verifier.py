@@ -913,7 +913,7 @@ class TestLLMFrontend:
             def generate(self, prompt):
                 self.call_count += 1
                 resp = json.dumps({
-                    "fwd_ops": [{"op": "AllGather", "x": "x", "output": "y", "gather_dim": 0}],
+                    "fwd_ops": [{"type": "AllGather", "x": "x", "output": "y", "gather_dim": 0}],
                     "bwd_ops": [],
                     "sharding": {"x": {"placements": ["Replicate"], "shape": [8, 16]}},
                 })
