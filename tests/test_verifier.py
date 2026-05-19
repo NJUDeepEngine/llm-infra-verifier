@@ -915,7 +915,7 @@ class TestLLMFrontend:
                 resp = json.dumps({
                     "fwd_ops": [{"type": "AllGather", "x": "x", "output": "y", "gather_dim": 0}],
                     "bwd_ops": [],
-                    "sharding": {"x": {"placements": ["Replicate"], "shape": [8, 16]}},
+                    "sharding": {"x": "Replicate"},
                 })
                 self.call_history.append((prompt, resp))
                 return resp

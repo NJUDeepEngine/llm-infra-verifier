@@ -203,8 +203,14 @@ class TestE2ETPMlp:
 
 
 class TestE2EPipelineParallel:
-    def test_pp_2stage_verify_passes(self):
-        """PP 2-stage: Send/Recv matched, comm legality passes."""
+    def test_pp_extracts_correct_ir_but_single_executor_fails(self):
+        """PP extraction works but single-executor verify_code() fails.
+
+        The MockLLM correctly extracts Send/Recv IR, but the single-device
+        MultiDeviceExecutor cannot execute PP programs (Recv output only
+        exists on the destination device).  verify_code() returns failure.
+        We verify the extracted IR structure is correct regardless.
+        """
         mesh = make_tp_mesh()
         rep = ShardingSpec(placements=(Replicate(),), mesh=mesh)
         tensors = {
@@ -218,9 +224,10 @@ class TestE2EPipelineParallel:
         loop = LLMVerificationLoop(llm=llm, max_iterations=1)
         result = loop.verify_code(code, mesh=mesh, tensor_states=tensors)
 
-        # PP programs raise execution errors in single-executor mode because
-        # Recv output only exists on the destination device.  Verify the
-        # extracted IR structure and comm legality on the program directly.
+        # verify_code() fails because strict executor can't run PP
+        assert not result.success
+
+        # But the extracted IR structure is correct
         prog = result.final_program
         assert prog is not None
         assert len(prog.ops) == 4
@@ -232,7 +239,7 @@ class TestE2EPipelineParallel:
         assert len(recvs) == 1
         assert sends[0].dst == recvs[0].dst
 
-        # Run executor in non-strict mode for PP
+        # Comm legality on the program itself passes (Send/Recv matched)
         executor = MultiDeviceExecutor(mesh)
         for ts in tensors.values():
             executor.register_tensor(ts)

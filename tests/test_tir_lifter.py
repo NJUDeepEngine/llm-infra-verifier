@@ -358,8 +358,14 @@ class TestBackwardGeneration:
 
 
 class TestE2ELiftAndVerify:
+    @staticmethod
+    def _input_tensors(result, input_names):
+        """Return only input/parameter tensors from LiftResult — not
+        intermediate or output tensors that the program should produce."""
+        return {n: result.tensors[n] for n in input_names if n in result.tensors}
+
     def test_linear_lift_execute_verify_all(self):
-        """TIR matmul → lift → executor → verify_all() all pass."""
+        """TIR matmul → lift → executor(strict) → verify_all() all pass."""
         mesh = make_tp_mesh()
         s1 = ShardingSpec(placements=(Shard(dim=1),), mesh=mesh)
         s0 = ShardingSpec(placements=(Shard(dim=0),), mesh=mesh)
@@ -373,8 +379,8 @@ class TestE2ELiftAndVerify:
         lifter = TIRLifter(sharding_specs={"X": s1, "W": s0})
         result = lifter.lift(tir_func)
 
-        executor = MultiDeviceExecutor(mesh)
-        for ts in result.tensors.values():
+        executor = MultiDeviceExecutor(mesh, strict=True)
+        for ts in self._input_tensors(result, ["X", "W"]).values():
             executor.register_tensor(ts)
         state = executor.run_program(result.fwd_program)
 
@@ -388,7 +394,11 @@ class TestE2ELiftAndVerify:
             assert vr.passed, f"{vr.condition} failed: {vr.details}"
 
     def test_mlp_multi_block(self):
-        """Multi-block MLP: matmul+silu+matmul+multiply+matmul → 1 AllReduce."""
+        """Multi-block MLP: matmul+silu+matmul+multiply+matmul → 1 AllReduce.
+
+        Only input/parameter tensors are registered; intermediates and
+        outputs must be produced by the lifted program itself.
+        """
         mesh = make_tp_mesh()
         rep = ShardingSpec(placements=(Replicate(),), mesh=mesh)
         s1 = ShardingSpec(placements=(Shard(dim=1),), mesh=mesh)
@@ -418,8 +428,9 @@ class TestE2ELiftAndVerify:
         assert len(result.collectives_inserted) == 1
         assert isinstance(result.collectives_inserted[0], AllReduce)
 
-        executor = MultiDeviceExecutor(mesh)
-        for ts in result.tensors.values():
+        input_names = ["X", "W_gate", "W_up", "W_down"]
+        executor = MultiDeviceExecutor(mesh, strict=True)
+        for ts in self._input_tensors(result, input_names).values():
             executor.register_tensor(ts)
         state = executor.run_program(result.fwd_program)
 
