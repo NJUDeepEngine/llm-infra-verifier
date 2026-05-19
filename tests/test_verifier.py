@@ -901,6 +901,31 @@ class TestLLMFrontend:
         assert not result.success
 
 
+    def test_llm_loop_rejects_illegal_collective(self):
+        """LLM loop must reject programs with illegal collectives (e.g. AllGather on Replicate)."""
+        from verifier.llm_frontend import LLMVerificationLoop
+        import json
+
+        class IllegalCollectiveLLM:
+            def __init__(self):
+                self.call_count = 0
+                self.call_history = []
+            def generate(self, prompt):
+                self.call_count += 1
+                resp = json.dumps({
+                    "fwd_ops": [{"op": "AllGather", "x": "x", "output": "y", "gather_dim": 0}],
+                    "bwd_ops": [],
+                    "sharding": {"x": {"placements": ["Replicate"], "shape": [8, 16]}},
+                })
+                self.call_history.append((prompt, resp))
+                return resp
+
+        mesh = DeviceMesh(shape=(2,), dim_names=("tp",))
+        loop = LLMVerificationLoop(llm=IllegalCollectiveLLM(), max_iterations=1)
+        result = loop.verify_code("y = allgather(x)", mesh=mesh)
+        assert not result.success
+
+
 class TestCommunicationLegality:
     def test_missing_input_state_fails(self):
         """Collective with no pre-op state should fail legality check."""
@@ -911,6 +936,25 @@ class TestCommunicationLegality:
         result = verifier.verify_communication_legality(prog, tensor_states={})
         assert not result.passed
         assert "no tensor state" in result.details
+
+    def test_standalone_inplace_allreduce_with_caller_state(self):
+        """Standalone in-place AllReduce(x='p', output='p') with caller-provided
+        Partial state must pass — the caller state IS the valid pre-op state."""
+        from verifier.solver import DistributedVerifier
+
+        mesh = DeviceMesh(shape=(2,), dim_names=("tp",))
+        spec_p = ShardingSpec(placements=(Partial(),), mesh=mesh)
+        p = TensorState(
+            name="p", global_shape=(8, 32),
+            local_shape=(8, 32),
+            sharding=spec_p, expr="p",
+        )
+        prog = Program("standalone", ops=[AllReduce(x="p", output="p")])
+        verifier = DistributedVerifier()
+        result = verifier.verify_communication_legality(
+            prog, tensor_states={"p": p},
+        )
+        assert result.passed, f"Expected pass but got: {result.details}"
 
     def test_inplace_allreduce_with_state_passes(self):
         """In-place AllReduce with correct pre-op state should pass."""

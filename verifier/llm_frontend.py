@@ -595,6 +595,26 @@ class LLMVerificationLoop:
                 analysis = analyzer.analyze(fwd_program, state)
 
                 if analysis.is_correct:
+                    # PlacementAnalyzer checks structure (missing/redundant
+                    # collectives) but not preconditions. Run the full
+                    # communication legality check to catch illegal ops
+                    # (e.g. AllGather on Replicate).
+                    from verifier.solver import DistributedVerifier
+                    dv = DistributedVerifier()
+                    legality = dv.verify_communication_legality(
+                        fwd_program, tensor_states=state,
+                    )
+                    if not legality.passed:
+                        verif_errors = [legality.details]
+                        errors_list = verif_errors
+                        if iteration < self.max_iterations - 1:
+                            feedback = self.prompt_builder.build_feedback_prompt(
+                                code, response, verif_errors,
+                            )
+                            response = self.llm.generate(feedback)
+                            call_history.append(("feedback", response))
+                        continue
+
                     bwd = ir_response.to_bwd_program() if ir_response.bwd_ops else None
                     return LLMVerifyResult(
                         success=True,

@@ -1297,10 +1297,18 @@ class DistributedVerifier:
         # Walk ops in program order, tracking live tensor state so that
         # preconditions are checked against pre-op state (not final state).
         # This is critical for in-place ops like AllReduce(x="p", output="p").
-        all_outputs = {op.output_name for op in program.ops if op.output_name}
+        #
+        # Seed `live` with caller-provided states that are NOT produced by a
+        # *different* earlier op.  For in-place ops (output == input), the
+        # caller-provided state IS the valid pre-op state and must be kept.
+        produced_by_other: set = set()
+        for op in program.ops:
+            out = op.output_name
+            if out and out not in op.input_names:
+                produced_by_other.add(out)
         live = {
             name: ts for name, ts in final_states.items()
-            if name not in all_outputs
+            if name not in produced_by_other
         }
 
         for op in program.ops:
