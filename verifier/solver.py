@@ -279,6 +279,28 @@ class Z3PlacementSolver:
             for m in range(self._mesh_ndim):
                 self.solver.add(y_vs[m] == IntVal(target_pl))
 
+    def _encode_gather_op(self, op):
+        """Encode AllGather/Gather: Shard(gather_dim) -> Replicate, others pass through.
+
+        When mesh_dim is set, only that dim is transformed.
+        When mesh_dim is None, each dim is conditionally transformed:
+        if input is Shard(gather_dim), output is Replicate; else passthrough.
+        """
+        x_vs = self._var(op.input_names[0])
+        y_vs = self._var(op.output_name)
+        shard_pl = IntVal(PL_S0 if op.gather_dim == 0 else PL_S1)
+        R = IntVal(PL_R)
+        md = op.mesh_dim
+        if md is not None and md < self._mesh_ndim:
+            for m in range(self._mesh_ndim):
+                if m == md:
+                    self.solver.add(y_vs[m] == R)
+                else:
+                    self.solver.add(y_vs[m] == x_vs[m])
+        else:
+            for m in range(self._mesh_ndim):
+                self.solver.add(y_vs[m] == If(x_vs[m] == shard_pl, R, x_vs[m]))
+
     def _encode_reducescatter(self, op):
         sd = op.scatter_dim
         target_pl = PL_S0 if sd == 0 else PL_S1
@@ -325,8 +347,10 @@ class Z3PlacementSolver:
                 self._encode_reducescatter(op)
             elif isinstance(op, AllToAll):
                 self._encode_alltoall(op)
-            elif isinstance(op, (AllReduce, AllGather, Gather)):
+            elif isinstance(op, AllReduce):
                 self._encode_collective_constrained(op, PL_R, op.mesh_dim)
+            elif isinstance(op, (AllGather, Gather)):
+                self._encode_gather_op(op)
             elif isinstance(op, (Broadcast, Reduce)):
                 self._encode_collective_constrained(op, PL_R, None)
             elif isinstance(op, Scatter):
@@ -1289,8 +1313,7 @@ class DistributedVerifier:
                             f"tensor: {ts.sharding}"
                         )
                 else:
-                    import warnings
-                    warnings.warn(
+                    errors.append(
                         f"{type(op).__name__}({op.x}): no tensor state available "
                         f"to verify precondition (input should be Partial)"
                     )
@@ -1307,6 +1330,11 @@ class DistributedVerifier:
                             f"AllGather({op.x}, dim={op.gather_dim}) called on tensor "
                             f"not sharded on dim {op.gather_dim}: {ts.sharding}"
                         )
+                else:
+                    errors.append(
+                        f"AllGather({op.x}): no tensor state available "
+                        f"to verify precondition"
+                    )
 
             elif isinstance(op, ReduceScatter):
                 if op.x in live:
@@ -1320,6 +1348,11 @@ class DistributedVerifier:
                             f"ReduceScatter({op.x}, dim={op.scatter_dim}) called on "
                             f"tensor already sharded on dim {op.scatter_dim}: {ts.sharding}"
                         )
+                else:
+                    errors.append(
+                        f"ReduceScatter({op.x}): no tensor state available "
+                        f"to verify precondition"
+                    )
 
             elif isinstance(op, AllToAll):
                 if op.x in live:
@@ -1333,6 +1366,11 @@ class DistributedVerifier:
                             f"AllToAll({op.x}, split={op.split_dim}) called on tensor "
                             f"not sharded on dim {op.split_dim}: {ts.sharding}"
                         )
+                else:
+                    errors.append(
+                        f"AllToAll({op.x}): no tensor state available "
+                        f"to verify precondition"
+                    )
 
             elif isinstance(op, Gather):
                 if op.x in live:
@@ -1346,6 +1384,11 @@ class DistributedVerifier:
                             f"Gather({op.x}, dim={op.gather_dim}) called on tensor "
                             f"not sharded on dim {op.gather_dim}: {ts.sharding}"
                         )
+                else:
+                    errors.append(
+                        f"Gather({op.x}): no tensor state available "
+                        f"to verify precondition"
+                    )
 
             elif isinstance(op, Send):
                 has_matching = any(

@@ -945,6 +945,50 @@ class TestMeshDimCollectives:
         # Should pass: dim 0 is Partial as required
         assert all(r.passed for r in results)
 
+    def test_allgather_no_mesh_dim_preserves_other_dims(self):
+        """AllGather(mesh_dim=None) on 2D mesh: only gathers Shard(gather_dim), preserves others."""
+        from z3 import sat, IntVal
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        solver.add_input("x", (Shard(dim=0), Shard(dim=1)))
+        prog = Program("ag_nodim", ops=[
+            AllGather(x="x", output="y", gather_dim=0),
+        ])
+        solver.encode_program(prog)
+
+        # dim 0: input is Shard(0) which matches gather_dim=0 → output is Replicate
+        solver.solver.push()
+        solver.solver.add(solver._var("y")[0] != IntVal(0))
+        assert solver.solver.check() != sat, "dim 0 should be Replicate"
+        solver.solver.pop()
+
+        # dim 1: input is Shard(1) which does NOT match gather_dim=0 → preserved
+        solver.solver.push()
+        solver.solver.add(solver._var("y")[1] != IntVal(2))  # PL_S1 = 2
+        assert solver.solver.check() != sat, "dim 1 should preserve Shard(1)"
+        solver.solver.pop()
+
+    def test_gather_no_mesh_dim_preserves_other_dims(self):
+        """Gather(mesh_dim=None) on 2D mesh preserves non-gathered dims."""
+        from z3 import sat, IntVal
+        solver = Z3PlacementSolver(mesh_ndim=2)
+        solver.add_input("x", (Shard(dim=0), Replicate()))
+        prog = Program("ga_nodim", ops=[
+            Gather(x="x", output="y", gather_dim=0),
+        ])
+        solver.encode_program(prog)
+
+        # dim 0: Shard(0) matches gather_dim=0 → Replicate
+        solver.solver.push()
+        solver.solver.add(solver._var("y")[0] != IntVal(0))
+        assert solver.solver.check() != sat
+        solver.solver.pop()
+
+        # dim 1: Replicate → preserved as Replicate
+        solver.solver.push()
+        solver.solver.add(solver._var("y")[1] != IntVal(0))
+        assert solver.solver.check() != sat
+        solver.solver.pop()
+
 
 # ── Wait / WaitAll solver encoding ──────────────────────────────────────────
 

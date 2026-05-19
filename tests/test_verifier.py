@@ -715,6 +715,32 @@ class TestSynthesis:
         assert ar_output in add_op.input_names, \
             f"Add should consume '{ar_output}' but has inputs {add_op.input_names}"
 
+    def test_tactic_remap_stops_at_redefinition(self):
+        """Remapping must stop when a later op redefines the tensor."""
+        from verifier.synthesis import Tactic, TacticType
+
+        # y is produced by first MatMul, consumed by Add via y_reduced,
+        # then redefined by second MatMul, consumed by final Add.
+        prog = Program(name="shadow")
+        prog.add(MatMul(a="x", b="w", output="y"))
+        prog.add(Add(a="y", b="bias1", output="z1"))
+        prog.add(MatMul(a="x2", b="w2", output="y"))  # redefines y
+        prog.add(Add(a="y", b="bias2", output="z2"))
+
+        tactic = Tactic(
+            type=TacticType.INSERT_ALLREDUCE,
+            op_index=0,
+            tensor_name="y",
+            output_name="y_reduced",
+        )
+        fixed = tactic.apply(prog)
+
+        # First Add (before redefinition) should consume y_reduced
+        assert fixed.ops[2].a == "y_reduced"
+        # Second Add (after redefinition of y) should consume y, not y_reduced
+        assert fixed.ops[4].a == "y"
+        assert "y_reduced" not in fixed.ops[4].input_names
+
 
 # ── LLM frontend tests ───────────────────────────────────────────────────────
 
@@ -853,6 +879,74 @@ class TestLLMFrontend:
         # Should succeed on first try (mock LLM outputs correct IR)
         assert result.success, f"LLM verification failed: {result.errors}"
         assert result.iterations == 1
+
+    def test_llm_loop_rejects_empty_program(self):
+        """LLM loop must not accept empty fwd_ops as success."""
+        from verifier.llm_frontend import LLMVerificationLoop
+        import json
+
+        class EmptyLLM:
+            def __init__(self):
+                self.call_count = 0
+                self.call_history = []
+            def generate(self, prompt):
+                self.call_count += 1
+                resp = json.dumps({"fwd_ops": [], "bwd_ops": [], "sharding": {}})
+                self.call_history.append((prompt, resp))
+                return resp
+
+        mesh = DeviceMesh(shape=(2,), dim_names=("tp",))
+        loop = LLMVerificationLoop(llm=EmptyLLM(), max_iterations=1)
+        result = loop.verify_code("y = x @ w", mesh=mesh)
+        assert not result.success
+
+
+class TestCommunicationLegality:
+    def test_missing_input_state_fails(self):
+        """Collective with no pre-op state should fail legality check."""
+        from verifier.solver import DistributedVerifier
+
+        prog = Program("no_state", ops=[AllReduce(x="p", output="p")])
+        verifier = DistributedVerifier()
+        result = verifier.verify_communication_legality(prog, tensor_states={})
+        assert not result.passed
+        assert "no tensor state" in result.details
+
+    def test_inplace_allreduce_with_state_passes(self):
+        """In-place AllReduce with correct pre-op state should pass."""
+        from verifier.solver import DistributedVerifier
+
+        mesh = DeviceMesh(shape=(2,), dim_names=("tp",))
+        spec_s1 = ShardingSpec(placements=(Shard(dim=1),), mesh=mesh)
+        spec_s0 = ShardingSpec(placements=(Shard(dim=0),), mesh=mesh)
+
+        x = TensorState(
+            name="x", global_shape=(8, 16),
+            local_shape=compute_local_shape((8, 16), spec_s1),
+            sharding=spec_s1, expr="x",
+        )
+        w = TensorState(
+            name="w", global_shape=(16, 32),
+            local_shape=compute_local_shape((16, 32), spec_s0),
+            sharding=spec_s0, expr="w",
+        )
+
+        prog = Program("inplace_ok", ops=[
+            MatMul(a="x", b="w", output="p"),
+            AllReduce(x="p", output="p"),
+        ])
+
+        import warnings
+        executor = MultiDeviceExecutor(mesh)
+        executor.register_tensor(x)
+        executor.register_tensor(w)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            state = executor.run_program(prog)
+
+        verifier = DistributedVerifier()
+        result = verifier.verify_communication_legality(prog, tensor_states=state)
+        assert result.passed
 
 
 # ── Temporal verification tests ──────────────────────────────────────────────

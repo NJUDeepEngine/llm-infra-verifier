@@ -576,12 +576,25 @@ class LLMVerificationLoop:
 
                 state = executor.run_program(fwd_program)
 
+                # Reject empty programs
+                if not fwd_program.ops or not state:
+                    verif_errors = [
+                        "Extracted program is empty or produced no output tensors"
+                    ]
+                    errors_list = verif_errors
+                    if iteration < self.max_iterations - 1:
+                        feedback = self.prompt_builder.build_feedback_prompt(
+                            code, response, verif_errors,
+                        )
+                        response = self.llm.generate(feedback)
+                        call_history.append(("feedback", response))
+                    continue
+
                 # Analyze
                 analyzer = PlacementAnalyzer()
                 analysis = analyzer.analyze(fwd_program, state)
 
                 if analysis.is_correct:
-                    # Success!
                     bwd = ir_response.to_bwd_program() if ir_response.bwd_ops else None
                     return LLMVerifyResult(
                         success=True,

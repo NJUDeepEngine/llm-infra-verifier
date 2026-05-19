@@ -121,7 +121,8 @@ class Tactic:
         if collective_op is not None:
             new_prog.ops.append(collective_op)
 
-        # Remap subsequent ops: replace references to tensor_name with output_name
+        # Remap subsequent ops: replace references to tensor_name with output_name.
+        # Stop remapping if a later op redefines tensor_name.
         input_map = {self.tensor_name: self.output_name}
         for i in range(self.op_index + 1, len(program.ops)):
             remapped = program.ops[i].clone_with_names(
@@ -129,6 +130,8 @@ class Tactic:
                 output_name=program.ops[i].output_name,
             )
             new_prog.ops.append(remapped)
+            if program.ops[i].output_name == self.tensor_name:
+                input_map = {}
 
         return new_prog
 
