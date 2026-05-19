@@ -48,6 +48,8 @@ from .ir import (
     Reshape,
     Transpose,
     FlashAttention,
+    Send,
+    Recv,
 )
 
 
